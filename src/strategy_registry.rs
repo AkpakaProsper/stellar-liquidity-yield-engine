@@ -329,11 +329,6 @@ impl StrategyRegistry {
             .unwrap_or_else(|| panic!("strategy not found"));
         strategy.is_active = false;
         strategy.updated_at = env.ledger().timestamp();
-                strategies.set(i, strategy);
-                found = true;
-                break;
-            }
-        }
 
         strategies.set(strategy_id, strategy);
         env.storage()
@@ -351,7 +346,8 @@ impl StrategyRegistry {
             approved_by: admin,
             approved_at: env.ledger().timestamp(),
             approval_type: 3, // Removal
-            comments: Symbol::new(&env, "Deactivated by admin"),
+            // `Symbol` only accepts [A-Za-z0-9_], so the label is a single word.
+            comments: Symbol::new(&env, "deactivated"),
         };
 
         Self::add_approval(&env, approval);
@@ -459,7 +455,7 @@ impl StrategyRegistry {
     }
 
     /// Paginated performance history with offset for bounded reads (Issue #107)
-    pub fn get_performance_history_paginated(
+    pub fn get_performance_history_page(
         env: Env,
         strategy_id: u32,
         limit: u32,

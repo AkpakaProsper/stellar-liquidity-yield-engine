@@ -147,6 +147,13 @@ impl StellarLiquidityYieldEngine {
         );
     }
 
+    /// Panic unless the contract is unpaused.
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("contract is paused");
+        }
+    }
+
     /// Require admin authorization
     fn require_admin(env: &Env, caller: Address) {
         let admin = Self::get_admin(env.clone());

@@ -1,4 +1,6 @@
+use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{Address, Env, Symbol, Vec as SorobanVec};
+use stellar_liquidity_yield_engine::RebalanceEngineClient;
 
 pub fn setup_rebalance_engine(env: &Env) -> (RebalanceEngineClient, Address) {
     let admin = Address::generate(env);

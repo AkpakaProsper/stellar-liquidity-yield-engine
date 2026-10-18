@@ -1119,7 +1119,12 @@ mod tests {
     }
 
     // ─── Insurance Integration ────────────────────────────────────────────────
-
+    //
+    // These helpers were written as if they lived inside the contract's
+    // `impl YieldVault` block but were placed in the test module, where `Self`
+    // does not resolve. Wrapping them in an inherent impl keeps them compiled
+    // and callable from tests without exposing them as contract entrypoints.
+    impl YieldVault {
     /// One-click deposit + insurance purchase.
     ///
     /// Deposits tokens into the vault and simultaneously purchases an insurance
@@ -1221,5 +1226,6 @@ mod tests {
         } else {
             (false, 0)
         }
+    }
     }
 }
