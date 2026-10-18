@@ -22,6 +22,25 @@ export interface RewardStreamInfo {
     lastUpdate: number;
     isActive: boolean;
     decimals: number;
+    /**
+     * Unix timestamp (seconds) after which the contract rejects claims for this
+     * stream. `0` means the stream never expires.
+     */
+    claimDeadline: number;
+}
+
+/**
+ * Whether a stream's claim window has closed.
+ *
+ * Mirrors the contract's check (`claim_deadline != 0 && now > claim_deadline`),
+ * so a client can tell a user before building a claim that the contract will
+ * reject with `ClaimDeadlinePassed`.
+ */
+export function isClaimDeadlinePassed(
+    stream: Pick<RewardStreamInfo, 'claimDeadline'>,
+    now: number = Math.floor(Date.now() / 1000)
+): boolean {
+    return stream.claimDeadline !== 0 && now > stream.claimDeadline;
 }
 
 /**
@@ -316,11 +335,22 @@ export class RewardsSDK {
         const pending = await this.getPendingRewards(user, vault);
 
         const claimAmounts = new Map<string, string>();
+        const allStreams = await this.getAllStreams();
         for (const idx of streams) {
             const amount = pending.streams.get(idx);
             if (amount) {
-                const stream = (await this.getAllStreams()).find(s => s.index === idx);
+                const stream = allStreams.find(s => s.index === idx);
                 if (stream) {
+                    // The contract refuses expired claims; fail here, naming the
+                    // stream and its deadline, instead of paying a fee for a
+                    // transaction that cannot succeed.
+                    if (isClaimDeadlinePassed(stream)) {
+                        throw new Error(
+                            `Reward stream ${idx} expired at ${stream.claimDeadline}; ` +
+                            'the contract will reject this claim'
+                        );
+                    }
+
                     const current = claimAmounts.get(stream.token) || '0';
                     claimAmounts.set(stream.token, BigIntString.add(current, amount));
                 }
@@ -849,6 +879,7 @@ export class RewardsSDK {
                 lastUpdate: Math.floor(Date.now() / 1000) - 3600,
                 isActive: true,
                 decimals: 7,
+                claimDeadline: 0, // no deadline
             },
             {
                 index: 1,
@@ -859,6 +890,7 @@ export class RewardsSDK {
                 lastUpdate: Math.floor(Date.now() / 1000) - 3600,
                 isActive: true,
                 decimals: 7,
+                claimDeadline: 0, // no deadline
             },
             {
                 index: 2,
@@ -869,6 +901,7 @@ export class RewardsSDK {
                 lastUpdate: Math.floor(Date.now() / 1000) - 3600,
                 isActive: true,
                 decimals: 7,
+                claimDeadline: 0, // no deadline
             },
         ];
     }
