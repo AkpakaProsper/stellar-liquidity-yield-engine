@@ -301,6 +301,9 @@ import { ImpermanentLossChart } from '@/components/ImpermanentLossChart';
 ## 🔒 Security Features
 
 ### Contract Security
+- **In-place Upgrades**: Every contract exposes admin-only `upgrade(admin, new_wasm_hash)`,
+  `migrate(admin)` and `get_storage_version()` so deployed state can be fixed
+  without changing the contract address — see [docs/UPGRADING.md](docs/UPGRADING.md)
 - **Emergency Pause**: Admin can pause all operations
 - **Access Control**: Role-based permissions
 - **Input Validation**: Comprehensive parameter checks
