@@ -55,6 +55,10 @@ pub const DEFAULT_MIN_WITHDRAW_SHARES: i128 = 1;
 /// instead of being stranded in the vault forever.
 pub const DUST_THRESHOLD: i128 = 1;
 
+// The contract's entrypoints are exported only when the vault itself is the
+// contract being deployed. The rebalance engine depends on this module's types
+// (and on nothing else here), and a wasm binary cannot export two contracts.
+#[cfg(feature = "yield-vault")]
 #[contractimpl]
 impl YieldVault {
     /// Initialize a new yield vault

@@ -4,7 +4,16 @@ use soroban_sdk::{
 };
 use soroban_sdk::token::TokenClient;
 
-use crate::YieldVaultClient;
+/// The single vault call this engine makes.
+///
+/// Declared as its own client instead of reusing the vault's generated
+/// `YieldVaultClient`, because importing that would pull the vault contract's
+/// entrypoints into a rebalance-engine wasm, and one wasm cannot export two
+/// contracts that share an entrypoint name such as `initialize`.
+#[soroban_sdk::contractclient(name = "VaultInfoClient")]
+pub trait YieldVaultInterface {
+    fn get_vault_info(env: Env) -> crate::yield_vault::VaultInfo;
+}
 
 /// Upper bound accepted for an oracle APY observation: 1,000,000 bps = 10,000%.
 /// Guards against a misconfigured feed pushing nonsense into rebalance maths.
@@ -933,7 +942,9 @@ impl RebalanceEngine {
 
         // The vault's real current pool, queried from the vault contract itself
         // rather than fabricated - see #154.
-        let current_pool = YieldVaultClient::new(&env, &vault_id).get_vault_info().pool_id;
+        let current_pool = VaultInfoClient::new(&env, &vault_id)
+            .get_vault_info()
+            .pool_id;
 
         // 1. Withdraw from current pool (atomic operation 1)
         let withdrawn = Self::perform_rebalance(

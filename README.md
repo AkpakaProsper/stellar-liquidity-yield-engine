@@ -381,11 +381,18 @@ There is no `scripts/` directory in this repo — deploy with the `soroban`
 CLI directly. All commands below run from the **repository root** (that's
 where `Cargo.toml` lives; the crate is *not* under `src/`).
 
-> **Known blocker:** `src/lib.rs` unconditionally includes
-> `src/governance.rs` (`mod governance;`), which does not compile — see
-> [GOVERNANCE_STATUS.md](GOVERNANCE_STATUS.md). Until that's fixed,
-> `cargo build` for this crate fails and none of the steps below will
-> produce a wasm file.
+> **One contract per wasm.** Soroban exports a contract's entrypoints under
+> their plain function names, so two contracts cannot live in the same wasm
+> binary — they collide on shared names such as `initialize` or `pause`. Each
+> contract is behind a Cargo feature; build the one you are deploying with
+> `--no-default-features --features <contract>`. A default `cargo build`
+> (every feature) is for host builds and tests only. `src/governance.rs` is
+> not part of the crate and is still incomplete — see
+> [GOVERNANCE_STATUS.md](GOVERNANCE_STATUS.md).
+
+Deployable contracts: `engine` (the umbrella `StellarLiquidityYieldEngine`),
+`yield-vault`, `rebalance-engine`, `reward-distributor`, `strategy-registry`,
+`il-insurance`, `actuary`.
 
 ```bash
 # 0. One-time setup: install the wasm target and create/fund a testnet identity
@@ -393,9 +400,11 @@ rustup target add wasm32-unknown-unknown
 soroban keys generate deployer --network testnet
 soroban keys fund deployer --network testnet
 
-# 1. Build the contract wasm
-cargo build --target wasm32-unknown-unknown --release
+# 1. Build one contract's wasm
+cargo build --target wasm32-unknown-unknown --release \
+  --no-default-features --features yield-vault
 # -> target/wasm32-unknown-unknown/release/stellar_liquidity_yield_engine.wasm
+# Repeat with a different --features value for each contract you deploy.
 
 # 2. (Optional) Optimize the wasm binary size
 soroban contract optimize \
