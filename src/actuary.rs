@@ -223,6 +223,9 @@ impl Actuary {
 
 #[cfg(test)]
 mod test {
+    // The crate is `no_std`; the test harness needs `std` for `catch_unwind`.
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 

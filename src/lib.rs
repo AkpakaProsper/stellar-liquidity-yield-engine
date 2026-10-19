@@ -2,6 +2,7 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec};
 
 /// Panics with the given error's debug representation if `cond` is false.
+#[allow(unused_macros)]
 macro_rules! require {
     ($cond:expr, $err:expr) => {
         if !$cond {
@@ -10,23 +11,42 @@ macro_rules! require {
     };
 }
 
+// Each contract is behind its own feature: a wasm binary can export only one
+// contract's entrypoints, because Soroban exports them under their plain
+// function names. See the `[features]` section of `Cargo.toml`.
+// The vault module is also compiled for a rebalance-engine build, which needs
+// `VaultInfo` for its vault client but must not export the vault's entrypoints.
+#[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
 mod yield_vault;
+#[cfg(feature = "rebalance-engine")]
 mod rebalance_engine;
+#[cfg(feature = "reward-distributor")]
 mod reward_distributor;
+#[cfg(feature = "strategy-registry")]
 mod strategy_registry;
+#[cfg(feature = "il-insurance")]
 mod il_insurance;
+#[cfg(feature = "actuary")]
 mod actuary;
 
+#[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
+#[cfg(feature = "rebalance-engine")]
 pub use rebalance_engine::*;
+#[cfg(feature = "reward-distributor")]
 pub use reward_distributor::*;
+#[cfg(feature = "strategy-registry")]
 pub use strategy_registry::*;
+#[cfg(feature = "il-insurance")]
 pub use il_insurance::*;
+#[cfg(feature = "actuary")]
 pub use actuary::*;
 
+#[cfg(feature = "engine")]
 #[contract]
 pub struct StellarLiquidityYieldEngine;
 
+#[cfg(feature = "engine")]
 #[contractimpl]
 impl StellarLiquidityYieldEngine {
     /// Initialize the yield engine with admin and registry
@@ -145,6 +165,13 @@ impl StellarLiquidityYieldEngine {
                 new_reward_distributor,
             ),
         );
+    }
+
+    /// Panic unless the contract is unpaused.
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("contract is paused");
+        }
     }
 
     /// Require admin authorization

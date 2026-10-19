@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    token::TokenClient, unwrap::UnwrapOptimized,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
+    unwrap::UnwrapOptimized, Address, Env, IntoVal, Map, Symbol, Vec,
 };
 
 /// Maximum number of concurrent reward streams supported
