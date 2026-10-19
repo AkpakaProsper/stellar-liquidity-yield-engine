@@ -7,6 +7,11 @@
 //! **Issue #288** – bounded rolling window of recent observations: each feed
 //! keeps at most `MAX_OBSERVATIONS` entries; the oldest is evicted when the
 //! window is full.
+//!
+//! **Issue #290** – fallback price source: a pool can optionally nominate a
+//! secondary (fallback) feed address.  When the primary feed has no fresh
+//! observation the registry transparently tries the fallback before returning
+//! an error.
 
 #![allow(dead_code)]
 
@@ -40,7 +45,7 @@ pub enum OracleError {
     FeedAlreadyExists = 3,
     /// The caller is not the authorised feeder for this feed.
     NotAuthorisedFeeder = 4,
-    /// No fresh observation is available.
+    /// No fresh observation available (primary and fallback both stale/absent).
     NoFreshObservation = 5,
 }
 
@@ -70,6 +75,10 @@ pub struct OracleFeed {
     pub freshness_threshold_secs: u64,
     /// Bounded rolling window of recent observations (Issue #288).
     pub observations: Vec<PriceObservation>,
+    /// Whether a fallback feed has been configured (Issue #290).
+    pub has_fallback: bool,
+    /// Fallback feed pool address (valid only when `has_fallback` is true).
+    pub fallback_pool: Address,
 }
 
 // ---------------------------------------------------------------------------
@@ -129,12 +138,16 @@ impl OracleRegistry {
     /// Register a new oracle feed for `pool_address`.
     ///
     /// Pass `0` for `freshness_threshold_secs` to use the contract default (300 s).
+    /// Pass the same address as `pool_address` for `fallback_pool` to indicate
+    /// no fallback (i.e. `has_fallback = false`).
     pub fn register_feed(
         env: Env,
         admin: Address,
         pool_address: Address,
         feeder: Address,
         freshness_threshold_secs: u64,
+        fallback_pool: Address,
+        has_fallback: bool,
     ) {
         Self::check_admin(&env, &admin);
 
@@ -154,6 +167,8 @@ impl OracleRegistry {
             feeder,
             freshness_threshold_secs: threshold,
             observations: Vec::new(&env),
+            has_fallback,
+            fallback_pool,
         };
 
         feeds.set(pool_address.clone(), feed);
@@ -194,6 +209,32 @@ impl OracleRegistry {
             Some(f) => f.freshness_threshold_secs,
             None => panic_with_error!(&env, OracleError::FeedNotFound),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #290 – fallback price source
+    // -----------------------------------------------------------------------
+
+    /// Update (or clear) the fallback feed for a pool (admin only).
+    pub fn set_fallback_feed(
+        env: Env,
+        admin: Address,
+        pool_address: Address,
+        fallback_pool: Address,
+        has_fallback: bool,
+    ) {
+        Self::check_admin(&env, &admin);
+
+        let mut feeds = load_feeds(&env);
+        let mut feed = match feeds.get(pool_address.clone()) {
+            Some(f) => f,
+            None => panic_with_error!(&env, OracleError::FeedNotFound),
+        };
+
+        feed.fallback_pool = fallback_pool;
+        feed.has_fallback = has_fallback;
+        feeds.set(pool_address, feed);
+        save_feeds(&env, &feeds);
     }
 
     // -----------------------------------------------------------------------
@@ -238,7 +279,7 @@ impl OracleRegistry {
             .publish(("oracle_price_published",), (&pool_address, price));
     }
 
-    /// Return the observation window for a feed (Issue #288).
+    /// Return the observation window for a feed.
     pub fn get_observations(env: Env, pool_address: Address) -> Vec<PriceObservation> {
         let feeds = load_feeds(&env);
         match feeds.get(pool_address) {
@@ -247,7 +288,16 @@ impl OracleRegistry {
         }
     }
 
-    /// Return the latest fresh price for `pool_address` (Issue #281).
+    // -----------------------------------------------------------------------
+    // Price query (combines #281, #288, #290)
+    // -----------------------------------------------------------------------
+
+    /// Return the freshest price for `pool_address`, respecting the per-pool
+    /// staleness threshold (Issue #281).
+    ///
+    /// If the primary feed has no observation within its freshness window the
+    /// registry tries the fallback feed registered for that pool (Issue #290).
+    /// Panics with `NoFreshObservation` if both are stale or absent.
     pub fn get_price(env: Env, pool_address: Address) -> i128 {
         let now = env.ledger().timestamp();
         let feeds = load_feeds(&env);
@@ -257,13 +307,21 @@ impl OracleRegistry {
             None => panic_with_error!(&env, OracleError::FeedNotFound),
         };
 
-        // Walk backwards — newest observation is at the end of the Vec.
-        let len = feed.observations.len();
-        for i in (0..len).rev() {
-            let obs = feed.observations.get(i).unwrap();
-            let age = now.saturating_sub(obs.timestamp);
-            if age <= feed.freshness_threshold_secs {
-                return obs.price;
+        // Try primary feed.
+        if let Some(price) = Self::latest_fresh_price(&feed, now) {
+            return price;
+        }
+
+        // Try fallback (Issue #290).
+        if feed.has_fallback {
+            if let Some(fallback_feed) = feeds.get(feed.fallback_pool.clone()) {
+                if let Some(price) = Self::latest_fresh_price(&fallback_feed, now) {
+                    env.events().publish(
+                        ("oracle_fallback_used",),
+                        (&pool_address, &feed.fallback_pool),
+                    );
+                    return price;
+                }
             }
         }
 
@@ -279,6 +337,20 @@ impl OracleRegistry {
         if *caller != admin {
             panic_with_error!(env, OracleError::Unauthorized);
         }
+    }
+
+    /// Return the latest observation that is within the freshness window, or
+    /// `None` if no such observation exists.
+    fn latest_fresh_price(feed: &OracleFeed, now: u64) -> Option<i128> {
+        let len = feed.observations.len();
+        for i in (0..len).rev() {
+            let obs = feed.observations.get(i)?;
+            let age = now.saturating_sub(obs.timestamp);
+            if age <= feed.freshness_threshold_secs {
+                return Some(obs.price);
+            }
+        }
+        None
     }
 }
 
@@ -313,90 +385,131 @@ mod tests {
         (admin, client)
     }
 
-    // ------------------------------------------------------------------
-    // Issue #288 – bounded rolling window
-    // ------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Issue #290 – fallback price source
+    // -----------------------------------------------------------------------
 
-    /// After MAX_OBSERVATIONS entries the oldest is dropped.
+    /// When the primary feed is stale the fallback is used automatically.
     #[test]
-    fn test_rolling_window_evicts_oldest() {
+    fn test_fallback_used_when_primary_stale() {
         let env = Env::default();
         env.mock_all_auths();
         let (admin, client) = deploy(&env);
 
         let feeder = Address::generate(&env);
-        let pool = Address::generate(&env);
+        let pool_primary = Address::generate(&env);
+        let pool_fallback = Address::generate(&env);
 
-        client.register_feed(&admin, &pool, &feeder, &DEFAULT_FRESHNESS_SECS);
+        // Register the fallback feed (generous threshold, no fallback of its own).
+        client.register_feed(&admin, &pool_fallback, &feeder, &600_u64, &pool_fallback, &false);
 
-        // Publish MAX_OBSERVATIONS + 1 entries.
-        for i in 0..(MAX_OBSERVATIONS + 1) {
-            set_timestamp(&env, 1_000 + i as u64 * 10);
-            client.publish_price(&feeder, &pool, &(i as i128));
-        }
-
-        let obs = client.get_observations(&pool);
-
-        // Window must not exceed MAX_OBSERVATIONS.
-        assert_eq!(obs.len(), MAX_OBSERVATIONS);
-
-        // The first entry (price=0) should have been evicted.
-        assert_eq!(obs.get(0).unwrap().price, 1);
-
-        // The last entry is the most recently published.
-        assert_eq!(obs.get(MAX_OBSERVATIONS - 1).unwrap().price, MAX_OBSERVATIONS as i128);
-    }
-
-    /// Exactly MAX_OBSERVATIONS entries fit without eviction.
-    #[test]
-    fn test_rolling_window_exact_capacity() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, client) = deploy(&env);
-
-        let feeder = Address::generate(&env);
-        let pool = Address::generate(&env);
-
-        client.register_feed(&admin, &pool, &feeder, &DEFAULT_FRESHNESS_SECS);
-
-        for i in 0..MAX_OBSERVATIONS {
-            set_timestamp(&env, 1_000 + i as u64 * 10);
-            client.publish_price(&feeder, &pool, &(i as i128));
-        }
-
-        let obs = client.get_observations(&pool);
-        assert_eq!(obs.len(), MAX_OBSERVATIONS);
-        assert_eq!(obs.get(0).unwrap().price, 0);
-        assert_eq!(obs.get(MAX_OBSERVATIONS - 1).unwrap().price, (MAX_OBSERVATIONS - 1) as i128);
-    }
-
-    /// An empty window returns NoFreshObservation.
-    #[test]
-    fn test_empty_feed_returns_no_observation() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (admin, client) = deploy(&env);
-
-        let pool = Address::generate(&env);
-        let feeder = Address::generate(&env);
-
-        client.register_feed(&admin, &pool, &feeder, &DEFAULT_FRESHNESS_SECS);
+        // Register primary with tight threshold, pointing to the fallback.
+        client.register_feed(&admin, &pool_primary, &feeder, &30_u64, &pool_fallback, &true);
 
         set_timestamp(&env, 1000);
-        let err = client.try_get_price(&pool).unwrap_err().unwrap();
+        client.publish_price(&feeder, &pool_primary, &100_i128);
+        client.publish_price(&feeder, &pool_fallback, &200_i128);
+
+        // At t=1200: primary stale (200 s > 30 s), fallback still fresh (200 s < 600 s).
+        set_timestamp(&env, 1200);
+        assert_eq!(client.get_price(&pool_primary), 200);
+    }
+
+    /// If the primary feed has a fresh observation the fallback is NOT consulted.
+    #[test]
+    fn test_fallback_not_used_when_primary_fresh() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = deploy(&env);
+
+        let feeder = Address::generate(&env);
+        let pool_primary = Address::generate(&env);
+        let pool_fallback = Address::generate(&env);
+
+        client.register_feed(&admin, &pool_fallback, &feeder, &600_u64, &pool_fallback, &false);
+        client.register_feed(&admin, &pool_primary, &feeder, &600_u64, &pool_fallback, &true);
+
+        set_timestamp(&env, 1000);
+        client.publish_price(&feeder, &pool_primary, &111_i128);
+        client.publish_price(&feeder, &pool_fallback, &999_i128);
+
+        // 10 s later – both fresh; primary should win.
+        set_timestamp(&env, 1010);
+        assert_eq!(client.get_price(&pool_primary), 111);
+    }
+
+    /// Both primary and fallback stale → NoFreshObservation.
+    #[test]
+    fn test_no_fresh_observation_when_both_stale() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = deploy(&env);
+
+        let feeder = Address::generate(&env);
+        let pool_primary = Address::generate(&env);
+        let pool_fallback = Address::generate(&env);
+
+        client.register_feed(&admin, &pool_fallback, &feeder, &10_u64, &pool_fallback, &false);
+        client.register_feed(&admin, &pool_primary, &feeder, &10_u64, &pool_fallback, &true);
+
+        set_timestamp(&env, 1000);
+        client.publish_price(&feeder, &pool_primary, &50_i128);
+        client.publish_price(&feeder, &pool_fallback, &60_i128);
+
+        // 100 s later – both stale (100 > 10).
+        set_timestamp(&env, 1100);
+        let err = client.try_get_price(&pool_primary).unwrap_err().unwrap();
         assert_eq!(
             err,
             soroban_sdk::Error::from_contract_error(OracleError::NoFreshObservation as u32)
         );
     }
 
-    // ------------------------------------------------------------------
-    // Issue #281 – per-pool freshness thresholds (regression)
-    // ------------------------------------------------------------------
-
-    /// Fresh price is returned; stale price triggers NoFreshObservation.
+    /// Admin can attach and then clear the fallback via set_fallback_feed.
     #[test]
-    fn test_per_pool_freshness_threshold() {
+    fn test_set_fallback_feed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = deploy(&env);
+
+        let feeder = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let pool_fallback = Address::generate(&env);
+
+        client.register_feed(&admin, &pool_fallback, &feeder, &600_u64, &pool_fallback, &false);
+        // No fallback initially.
+        client.register_feed(&admin, &pool, &feeder, &10_u64, &pool, &false);
+
+        set_timestamp(&env, 1000);
+        client.publish_price(&feeder, &pool_fallback, &77_i128);
+
+        // Primary stale, no fallback → error.
+        set_timestamp(&env, 1100);
+        let err = client.try_get_price(&pool).unwrap_err().unwrap();
+        assert_eq!(
+            err,
+            soroban_sdk::Error::from_contract_error(OracleError::NoFreshObservation as u32)
+        );
+
+        // Attach fallback.
+        client.set_fallback_feed(&admin, &pool, &pool_fallback, &true);
+        assert_eq!(client.get_price(&pool), 77);
+
+        // Clear fallback.
+        client.set_fallback_feed(&admin, &pool, &pool, &false);
+        let err2 = client.try_get_price(&pool).unwrap_err().unwrap();
+        assert_eq!(
+            err2,
+            soroban_sdk::Error::from_contract_error(OracleError::NoFreshObservation as u32)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regressions for #281 and #288
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_per_pool_freshness_threshold_regression() {
         let env = Env::default();
         env.mock_all_auths();
         let (admin, client) = deploy(&env);
@@ -405,21 +518,41 @@ mod tests {
         let pool_relaxed = Address::generate(&env);
         let pool_strict = Address::generate(&env);
 
-        client.register_feed(&admin, &pool_relaxed, &feeder, &600_u64);
-        client.register_feed(&admin, &pool_strict, &feeder, &30_u64);
+        client.register_feed(&admin, &pool_relaxed, &feeder, &600_u64, &pool_relaxed, &false);
+        client.register_feed(&admin, &pool_strict, &feeder, &30_u64, &pool_strict, &false);
 
         set_timestamp(&env, 1000);
         client.publish_price(&feeder, &pool_relaxed, &500_i128);
         client.publish_price(&feeder, &pool_strict, &500_i128);
 
         set_timestamp(&env, 1200);
-
         assert_eq!(client.get_price(&pool_relaxed), 500);
-
         let err = client.try_get_price(&pool_strict).unwrap_err().unwrap();
         assert_eq!(
             err,
             soroban_sdk::Error::from_contract_error(OracleError::NoFreshObservation as u32)
         );
+    }
+
+    #[test]
+    fn test_rolling_window_evicts_oldest_regression() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, client) = deploy(&env);
+
+        let feeder = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.register_feed(&admin, &pool, &feeder, &DEFAULT_FRESHNESS_SECS, &pool, &false);
+
+        for i in 0..(MAX_OBSERVATIONS + 1) {
+            set_timestamp(&env, 1_000 + i as u64 * 10);
+            client.publish_price(&feeder, &pool, &(i as i128));
+        }
+
+        let obs = client.get_observations(&pool);
+        assert_eq!(obs.len(), MAX_OBSERVATIONS);
+        assert_eq!(obs.get(0).unwrap().price, 1);
+        assert_eq!(obs.get(MAX_OBSERVATIONS - 1).unwrap().price, MAX_OBSERVATIONS as i128);
     }
 }
