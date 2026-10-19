@@ -255,7 +255,7 @@ mod tests {
         client.initialize(&admin, &treasury, &swap_router);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.add_reward_stream(&non_admin, &Address::generate(&env), &1000, &7);
+            client.add_reward_stream(&non_admin, &Address::generate(&env), &1000, &7, &0);
         }));
         assert!(result.is_err(), "Non-admin should not be able to add reward streams");
     }

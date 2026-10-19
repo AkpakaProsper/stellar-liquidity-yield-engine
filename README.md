@@ -183,7 +183,10 @@ Multi-token reward system supporting:
 - **USDC**: Stablecoin rewards
 - **Native Tokens**: Project-specific reward tokens
 - **Merkle Distribution**: Efficient off-chain calculation
-- **Claim Deadlines**: Time-limited reward claims
+- **Claim Deadlines**: Time-limited reward claims — each stream carries a
+  `claim_deadline` (Unix seconds) set in `add_reward_stream` and adjustable with
+  `set_claim_deadline`; `claim_rewards` rejects a stream once the ledger passes
+  it. A deadline of `0` means the stream never expires.
 - **Fee Structure**: Performance and management fees
 
 ### Claiming Rewards
