@@ -25,6 +25,10 @@ export type { VolatilitySource, VolatilityMetrics, PoolMetrics, Opportunity } fr
 // When a real registry contract is available, replace `fetchActiveStrategies`
 // with a contract call to `get_active_strategies`.
 export { StrategyRegistryClient } from './strategyRegistryClient';
+
+// Keeper write pacing: rate-limit transaction submissions to avoid throttling.
+export { WriteRateLimiter } from './utils/rateLimiter';
+export type { WriteRateLimiterOptions, WriteRateLimiterStats } from './utils/rateLimiter';
 // TEMP-VERIFY-DISABLED (pre-existing syntax error unrelated to this change, restored after check): export { AutoRebalancer, runScheduledRebalancer } from './bots/autoRebalancer';
 
 // Governance SDK exports
