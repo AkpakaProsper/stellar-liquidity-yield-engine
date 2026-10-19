@@ -30,6 +30,8 @@ mod strategy_registry;
 mod il_insurance;
 #[cfg(feature = "actuary")]
 mod actuary;
+#[cfg(feature = "oracle-registry")]
+mod oracle_registry;
 
 #[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
@@ -43,6 +45,8 @@ pub use strategy_registry::*;
 pub use il_insurance::*;
 #[cfg(feature = "actuary")]
 pub use actuary::*;
+#[cfg(feature = "oracle-registry")]
+pub use oracle_registry::*;
 
 #[cfg(feature = "engine")]
 #[contract]
