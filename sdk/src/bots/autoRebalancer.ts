@@ -10,6 +10,7 @@ export interface RebalancerConfig {
   minApyDelta: number; // Basis points
   maxIlTolerance: number; // Basis points
   cooldownHours: number;
+  cronExpression?: string;
   telegramWebhookUrl?: string;
   discordWebhookUrl?: string;
   riskTolerance: number; // 1-10
@@ -39,6 +40,7 @@ export class AutoRebalancer {
   private executor: ArbitrageExecutor;
   private executionHistory: RebalanceResult[] = [];
   private lastExecutionTime: number = 0;
+  private lastConsumedMinute: number = -1;
   private lagMonitor?: RpcLagMonitor;
   private lastLag?: RpcLagReport;
 
@@ -203,10 +205,72 @@ export class AutoRebalancer {
 
   /**
    * Check if enough time has passed since last execution (cooldown)
+   * and if the current time matches the cron expression schedule.
+   * Both conditions must be satisfied when cronExpression is set;
+   * cooldown must never bypass the schedule.
+   * The last consumed scheduled minute is tracked to prevent
+   * repeated rebalances during the same matching minute.
    */
   private isReadyForRebalance(): boolean {
     const cooldownMs = this.config.cooldownHours * 3600 * 1000;
-    return Date.now() - this.lastExecutionTime >= cooldownMs;
+    const cooldownReady = Date.now() - this.lastExecutionTime >= cooldownMs;
+    const now = new Date();
+    const currentMinute = now.getMinutes();
+
+    if (!this.config.cronExpression) {
+      return cooldownReady;
+    }
+
+    const cronMatch = this.isCronTime(currentMinute);
+    if (cronMatch && cooldownReady) {
+      if (currentMinute !== this.lastConsumedMinute) {
+        this.lastConsumedMinute = currentMinute;
+        return true;
+      }
+      return false; // same minute already consumed
+    }
+
+    if (cronMatch && !cooldownReady) {
+      // Cron matches but cooldown not satisfied — do not consume schedule
+      return false;
+    }
+
+    return false;
+  }
+
+/**
+   * Check if the current time matches the cron expression.
+   * Supports patterns like: every15m (every 15 minutes), minuteValue (e.g. 0).
+   * @param minute The current minute value (0-59) to check against the expression.
+   */
+  private isCronTime(minute: number): boolean {
+    if (!this.config.cronExpression) return false;
+
+    const parts = this.config.cronExpression.trim().split(/\s+/);
+    const minutePart = parts[0] || '';
+
+    if (minutePart === '*') return true;
+
+    if (minutePart.startsWith('*/')) {
+      const interval = parseInt(minutePart.slice(2), 10);
+      if (!isNaN(interval) && interval > 0) {
+        return minute % interval === 0;
+      }
+    }
+
+    if (minutePart.startsWith('every')) {
+      const numberPart = minutePart.replace('every', '').replace('m', '').replace('M', '').trim();
+      const interval = parseInt(numberPart, 10);
+      if (!isNaN(interval) && interval > 0) {
+        return minute % interval === 0;
+      }
+    }
+
+    if (minutePart === String(minute)) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -298,6 +362,9 @@ Time: ${new Date(result.timestamp).toISOString()}
  * Cron-compatible entry point for scheduled execution
  * Usage: add a crontab entry that runs `node dist/bots/autoRebalancer.js`
  * every 15 minutes, e.g. "/15 * * * *".
+ *
+ * Cron scheduling mode: set CRON_EXPRESSION env var (e.g. every15m)
+ * to enable cron-based cadence alongside the existing cooldown-based mode.
  */
 async function runScheduledRebalancer() {
   const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
@@ -308,6 +375,7 @@ async function runScheduledRebalancer() {
     minApyDelta: parseInt(process.env.MIN_APY_DELTA || '200'),
     maxIlTolerance: parseInt(process.env.MAX_IL_TOLERANCE || '100'),
     cooldownHours: parseInt(process.env.COOLDOWN_HOURS || '24'),
+    cronExpression: process.env.CRON_EXPRESSION,
     telegramWebhookUrl: process.env.TELEGRAM_WEBHOOK_URL,
     discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
     riskTolerance: parseInt(process.env.RISK_TOLERANCE || '5'),
@@ -322,6 +390,12 @@ async function runScheduledRebalancer() {
 
   console.log(`[${new Date().toISOString()}] Rebalancer execution:`, results);
   console.log('Cumulative metrics:', rebalancer.getCumulativeMetrics());
+
+  if (config.cronExpression) {
+    console.log(`Cron schedule active: ${config.cronExpression}`);
+  } else {
+    console.log(`Cooldown mode active: ${config.cooldownHours}h intervals`);
+  }
 }
 
 // Execute if run directly
