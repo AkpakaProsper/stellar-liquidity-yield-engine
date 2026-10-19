@@ -67,6 +67,40 @@ impl Actuary {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "pricing_params"), &params);
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
+    }
+
+    /// Require the caller to be the stored admin.
+    fn require_admin(env: &Env, caller: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "admin"))
+            .unwrap();
+        if caller != admin {
+            panic!("unauthorized: admin required");
+        }
     }
 
     /// Submit results of off-chain Monte Carlo simulation.
@@ -223,6 +257,9 @@ impl Actuary {
 
 #[cfg(test)]
 mod test {
+    // The crate is `no_std`; the test harness needs `std` for `catch_unwind`.
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
@@ -276,3 +313,4 @@ mod test {
         assert!(result.is_ok());
     }
 }
+

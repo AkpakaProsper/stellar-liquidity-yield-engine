@@ -2,6 +2,7 @@
 use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec};
 
 /// Panics with the given error's debug representation if `cond` is false.
+#[allow(unused_macros)]
 macro_rules! require {
     ($cond:expr, $err:expr) => {
         if !$cond {
@@ -10,23 +11,44 @@ macro_rules! require {
     };
 }
 
+// Each contract is behind its own feature: a wasm binary can export only one
+// contract's entrypoints, because Soroban exports them under their plain
+// function names. See the `[features]` section of `Cargo.toml`.
+mod upgrade;
+
+// The vault module is also compiled for a rebalance-engine build, which needs
+// `VaultInfo` for its vault client but must not export the vault's entrypoints.
+#[cfg(any(feature = "yield-vault", feature = "rebalance-engine"))]
 mod yield_vault;
+#[cfg(feature = "rebalance-engine")]
 mod rebalance_engine;
+#[cfg(feature = "reward-distributor")]
 mod reward_distributor;
+#[cfg(feature = "strategy-registry")]
 mod strategy_registry;
+#[cfg(feature = "il-insurance")]
 mod il_insurance;
+#[cfg(feature = "actuary")]
 mod actuary;
 
+#[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
+#[cfg(feature = "rebalance-engine")]
 pub use rebalance_engine::*;
+#[cfg(feature = "reward-distributor")]
 pub use reward_distributor::*;
+#[cfg(feature = "strategy-registry")]
 pub use strategy_registry::*;
+#[cfg(feature = "il-insurance")]
 pub use il_insurance::*;
+#[cfg(feature = "actuary")]
 pub use actuary::*;
 
+#[cfg(feature = "engine")]
 #[contract]
 pub struct StellarLiquidityYieldEngine;
 
+#[cfg(feature = "engine")]
 #[contractimpl]
 impl StellarLiquidityYieldEngine {
     /// Initialize the yield engine with admin and registry
@@ -51,6 +73,28 @@ impl StellarLiquidityYieldEngine {
         
         // Initialize paused state to false
         env.storage().instance().set(&Symbol::new(&env, "paused"), &false);
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
     }
 
     /// Check if contract is paused
@@ -145,6 +189,13 @@ impl StellarLiquidityYieldEngine {
                 new_reward_distributor,
             ),
         );
+    }
+
+    /// Panic unless the contract is unpaused.
+    fn require_not_paused(env: &Env) {
+        if Self::is_paused(env.clone()) {
+            panic!("contract is paused");
+        }
     }
 
     /// Require admin authorization

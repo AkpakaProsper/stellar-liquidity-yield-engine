@@ -4,7 +4,16 @@ use soroban_sdk::{
 };
 use soroban_sdk::token::TokenClient;
 
-use crate::YieldVaultClient;
+/// The single vault call this engine makes.
+///
+/// Declared as its own client instead of reusing the vault's generated
+/// `YieldVaultClient`, because importing that would pull the vault contract's
+/// entrypoints into a rebalance-engine wasm, and one wasm cannot export two
+/// contracts that share an entrypoint name such as `initialize`.
+#[soroban_sdk::contractclient(name = "VaultInfoClient")]
+pub trait YieldVaultInterface {
+    fn get_vault_info(env: Env) -> crate::yield_vault::VaultInfo;
+}
 
 /// Upper bound accepted for an oracle APY observation: 1,000,000 bps = 10,000%.
 /// Guards against a misconfigured feed pushing nonsense into rebalance maths.
@@ -124,6 +133,28 @@ impl RebalanceEngine {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "max_apy_age"), &DEFAULT_MAX_APY_AGE);
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
     }
 
     /// Create a new rebalance strategy
@@ -933,7 +964,9 @@ impl RebalanceEngine {
 
         // The vault's real current pool, queried from the vault contract itself
         // rather than fabricated - see #154.
-        let current_pool = YieldVaultClient::new(&env, &vault_id).get_vault_info().pool_id;
+        let current_pool = VaultInfoClient::new(&env, &vault_id)
+            .get_vault_info()
+            .pool_id;
 
         // 1. Withdraw from current pool (atomic operation 1)
         let withdrawn = Self::perform_rebalance(

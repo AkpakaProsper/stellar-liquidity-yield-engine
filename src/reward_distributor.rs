@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    token::TokenClient, unwrap::UnwrapOptimized,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
+    unwrap::UnwrapOptimized, Address, Env, IntoVal, Map, Symbol, Vec,
 };
 
 /// Maximum number of concurrent reward streams supported
@@ -25,6 +25,9 @@ pub struct RewardStream {
     pub last_update: u64,        // Last timestamp when rewards were updated
     pub is_active: bool,         // Whether stream is currently active
     pub decimals: u32,           // Token decimals (7 for SAC, 18 for Soroban)
+    /// Unix timestamp after which claims against this stream are rejected.
+    /// `0` means the stream never expires.
+    pub claim_deadline: u64,
 }
 
 /// User's reward debt for a specific stream (Synthetix-style)
@@ -150,6 +153,8 @@ pub enum RewardError {
     EmergencyModeActive = 9,
     InvalidVault = 10,
     AlreadyInitialized = 11,
+    /// The stream's `claim_deadline` has passed; it can no longer be claimed.
+    ClaimDeadlinePassed = 12,
 }
 
 #[contractimpl]
@@ -195,18 +200,45 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "next_swap_id"), &1u64);
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
     }
 
     // ==================== Admin Functions ====================
 
     /// Add a new reward stream (admin only)
     /// Returns the index of the new stream
+    ///
+    /// `claim_deadline` is the Unix timestamp after which `claim_rewards`
+    /// rejects the stream; `0` means the stream never expires. It can be
+    /// changed later with [`Self::set_claim_deadline`].
     pub fn add_reward_stream(
         env: Env,
         admin: Address,
         token: Address,
         rate_per_second: i128,
         decimals: u32,
+        claim_deadline: u64,
     ) -> u32 {
         Self::require_admin(&env, admin);
         Self::require_not_paused(&env);
@@ -226,6 +258,7 @@ impl MultiRewardDistributor {
             last_update: current_time,
             is_active: true,
             decimals,
+            claim_deadline,
         };
 
         streams.push_back(new_stream);
@@ -236,10 +269,44 @@ impl MultiRewardDistributor {
         // Emit event
         env.events().publish(
             ("reward_stream_added", stream_index),
-            (&token, rate_per_second),
+            (&token, rate_per_second, claim_deadline),
         );
 
         stream_index
+    }
+
+    /// Set or clear the claim deadline of an existing stream (admin only).
+    ///
+    /// `claim_deadline` of `0` removes the deadline, making the stream claimable
+    /// indefinitely again. Extending a deadline is the way to reopen a stream
+    /// that already expired, since claims are rejected on comparison with the
+    /// current ledger time rather than on a stored "expired" flag.
+    pub fn set_claim_deadline(
+        env: Env,
+        admin: Address,
+        stream_index: u32,
+        claim_deadline: u64,
+    ) {
+        Self::require_admin(&env, admin.clone());
+
+        let mut streams = Self::get_streams(&env);
+        if stream_index >= streams.len() {
+            panic_with_error!(&env, RewardError::InvalidStream);
+        }
+
+        let mut stream = streams.get(stream_index).unwrap();
+        let previous_deadline = stream.claim_deadline;
+        stream.claim_deadline = claim_deadline;
+        streams.set(stream_index, stream);
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "streams"), &streams);
+
+        env.events().publish(
+            ("claim_deadline_updated", stream_index),
+            (admin, previous_deadline, claim_deadline),
+        );
     }
 
     /// Update reward rate for existing stream (admin only)
@@ -388,6 +455,13 @@ impl MultiRewardDistributor {
             }
 
             let stream = streams.get(stream_index).unwrap();
+
+            // A deadline of 0 means "no deadline"; anything else closes the
+            // stream to claims once the ledger passes it.
+            if stream.claim_deadline != 0 && current_time > stream.claim_deadline {
+                panic_with_error!(env, RewardError::ClaimDeadlinePassed);
+            }
+
             let mut reward_debt = Self::get_user_reward_debt(&env, &user, stream_index);
 
             let pending = reward_debt.pending_rewards;
@@ -1102,7 +1176,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
     use soroban_sdk::{
         token::{StellarAssetClient, TokenClient},
         Env, IntoVal, Symbol,
@@ -1141,7 +1215,7 @@ mod tests {
         let user_b = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.add_reward_stream(&admin, &token, &1000, &7);
+        client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &1_000_000);
 
         let rewards_a = client.update_rewards(&user_a, &token, &1000, &7);
@@ -1164,7 +1238,7 @@ mod tests {
         let user = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.add_reward_stream(&admin, &token, &1000, &7);
+        client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &10_000_000);
 
         client.update_rewards(&user, &token, &1000, &7);
@@ -1185,7 +1259,7 @@ mod tests {
         let user = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.add_reward_stream(&admin, &token, &1000, &7);
+        client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.deactivate_stream(&admin, &0);
 
         let rewards = client.update_rewards(&user, &token, &1000, &7);
@@ -1201,7 +1275,7 @@ mod tests {
         let user = Address::generate(&env);
         let token = Address::generate(&env);
 
-        client.add_reward_stream(&admin, &token, &1000, &7);
+        client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &1_000_000);
 
         client.set_auto_compound_config(&user, &token, &5000, &true);
@@ -1210,5 +1284,243 @@ mod tests {
         let reinvest = client.execute_auto_compound(&user, &token, &Vec::from_array(&env, [0u32]));
         let total = reinvest.get(token.clone()).unwrap_or(0);
         assert!(total >= 0);
+    }
+
+    // ==================== Claim deadlines (Issue #121) ====================
+
+    /// Deploy a distributor holding one funded stream.
+    ///
+    /// Returns `(admin, treasury, client, token_admin, token_client)` for the
+    /// stream's reward token, already minted onto the contract.
+    fn setup_stream(
+        env: &Env,
+        rate_per_second: i128,
+        claim_deadline: u64,
+    ) -> (
+        Address,
+        Address,
+        MultiRewardDistributorClient,
+        StellarAssetClient,
+        TokenClient,
+    ) {
+        let admin = Address::generate(env);
+        let treasury = Address::generate(env);
+        let swap_router = Address::generate(env);
+
+        let reward_token = env.register_stellar_asset_contract_v2(admin.clone());
+        let token_admin = StellarAssetClient::new(env, &reward_token.address());
+        let token_client = TokenClient::new(env, &reward_token.address());
+
+        let contract_id = env.register_contract(None, MultiRewardDistributor);
+        let client = MultiRewardDistributorClient::new(env, &contract_id);
+        client.initialize(&admin, &treasury, &swap_router);
+        client.add_reward_stream(
+            &admin,
+            &reward_token.address(),
+            &rate_per_second,
+            &7,
+            &claim_deadline,
+        );
+
+        // The distributor can only pay what it holds.
+        token_admin.mint(&admin, &1_000_000_000);
+        client.fund_reward_pool(&admin, &reward_token.address(), &1_000_000_000);
+
+        (admin, treasury, client, token_admin, token_client)
+    }
+
+    /// Accrue rewards for `user` over `elapsed` seconds and return the accrued
+    /// amount that is queued for claiming.
+    fn accrue(
+        env: &Env,
+        client: &MultiRewardDistributorClient,
+        user: &Address,
+        vault: &Address,
+        elapsed: u64,
+    ) -> i128 {
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + elapsed);
+        client.update_rewards(user, vault, &1_000, &7);
+        client
+            .get_pending_rewards(user, &Vec::from_array(env, [0u32]))
+            .get(0)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_claim_before_deadline_transfers_rewards() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (_admin, treasury, client, _token_admin, token_client) =
+            setup_stream(&env, 1_000, 5_000);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+
+        let pending = accrue(&env, &client, &user, &vault, 500);
+        assert!(pending > 0, "the stream must accrue rewards to claim");
+
+        // One second before the deadline the claim still goes through.
+        env.ledger().set_timestamp(4_999);
+        client.claim_rewards(&user, &vault, &indices, &None::<Address>);
+
+        let fee = pending * 25 / 10_000;
+        assert_eq!(token_client.balance(&user), pending - fee);
+        assert_eq!(token_client.balance(&treasury), fee);
+        assert_eq!(
+            client.get_pending_rewards(&user, &indices).get(0).unwrap(),
+            0,
+            "a paid claim clears the user's debt"
+        );
+    }
+
+    #[test]
+    fn test_claim_after_deadline_is_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (_admin, _treasury, client, _token_admin, token_client) =
+            setup_stream(&env, 1_000, 2_000);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+
+        let pending = accrue(&env, &client, &user, &vault, 500);
+
+        // One second past the deadline the claim is refused.
+        env.ledger().set_timestamp(2_001);
+        let err = client
+            .try_claim_rewards(&user, &vault, &indices, &None::<Address>)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::ClaimDeadlinePassed.into());
+
+        // Nothing moved: no payout, and the debt survives so an extended
+        // deadline can still pay it.
+        assert_eq!(token_client.balance(&user), 0);
+        assert_eq!(
+            client.get_pending_rewards(&user, &indices).get(0).unwrap(),
+            pending
+        );
+    }
+
+    #[test]
+    fn test_zero_deadline_never_expires() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (_admin, _treasury, client, _token_admin, token_client) =
+            setup_stream(&env, 1_000, 0);
+        assert_eq!(client.get_stream(&0).claim_deadline, 0);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+
+        let pending = accrue(&env, &client, &user, &vault, 500);
+
+        // A zero deadline means "no deadline", however far the ledger moves.
+        env.ledger().set_timestamp(100_000_000);
+        client.claim_rewards(&user, &vault, &indices, &None::<Address>);
+
+        assert_eq!(token_client.balance(&user), pending - pending * 25 / 10_000);
+    }
+
+    #[test]
+    fn test_deadline_is_visible_on_the_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (_admin, _treasury, client, _token_admin, _token_client) =
+            setup_stream(&env, 1_000, 42_000);
+
+        assert_eq!(client.get_stream(&0).claim_deadline, 42_000);
+    }
+
+    #[test]
+    fn test_set_claim_deadline_is_admin_only_and_reopens_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (admin, _treasury, client, _token_admin, token_client) =
+            setup_stream(&env, 1_000, 2_000);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+        let pending = accrue(&env, &client, &user, &vault, 500);
+
+        env.ledger().set_timestamp(2_001);
+        let stranger = Address::generate(&env);
+        let err = client
+            .try_set_claim_deadline(&stranger, &0, &10_000)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::Unauthorized.into());
+        assert_eq!(client.get_stream(&0).claim_deadline, 2_000);
+
+        // The admin can push the deadline out, which reopens the stream.
+        client.set_claim_deadline(&admin, &0, &10_000);
+        assert_eq!(client.get_stream(&0).claim_deadline, 10_000);
+
+        env.ledger().set_timestamp(3_000);
+        client.claim_rewards(&user, &vault, &indices, &None::<Address>);
+        assert_eq!(token_client.balance(&user), pending - pending * 25 / 10_000);
+    }
+
+    #[test]
+    fn test_set_claim_deadline_rejects_unknown_stream() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        let (admin, _treasury, client, _token_admin, _token_client) =
+            setup_stream(&env, 1_000, 0);
+
+        let err = client
+            .try_set_claim_deadline(&admin, &7, &10_000)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::InvalidStream.into());
+    }
+
+    #[test]
+    fn test_auto_compound_respects_the_claim_deadline() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000);
+
+        let (_admin, _treasury, client, _token_admin, token_client) =
+            setup_stream(&env, 1_000, 2_000);
+
+        let user = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let indices = Vec::from_array(&env, [0u32]);
+
+        let pending = accrue(&env, &client, &user, &vault, 500);
+        // Auto-compound is configured per reward token, not per vault.
+        let reward_token = client.get_stream(&0).token;
+        client.set_auto_compound_config(&user, &reward_token, &5_000, &true);
+
+        // `execute_auto_compound` goes through `claim_rewards`, so an expired
+        // deadline blocks the claim half of the flow as well.
+        env.ledger().set_timestamp(2_001);
+        let err = client
+            .try_execute_auto_compound(&user, &vault, &indices)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RewardError::ClaimDeadlinePassed.into());
+        assert_eq!(token_client.balance(&user), 0);
+        assert_eq!(
+            client.get_pending_rewards(&user, &indices).get(0).unwrap(),
+            pending
+        );
     }
 }

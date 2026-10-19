@@ -29,6 +29,19 @@ export { StrategyRegistryClient } from './strategyRegistryClient';
 // Keeper write pacing: rate-limit transaction submissions to avoid throttling.
 export { WriteRateLimiter } from './utils/rateLimiter';
 export type { WriteRateLimiterOptions, WriteRateLimiterStats } from './utils/rateLimiter';
+
+// RPC synchronization: ledger-head lag detection for keepers.
+export {
+  RpcLagMonitor,
+  checkRpcLag,
+  computeLedgerLag,
+  classifyLag,
+  formatLagMessage,
+  DEFAULT_WARNING_LEDGERS,
+  DEFAULT_CRITICAL_LEDGERS,
+  LEDGER_CLOSE_TIME_SECONDS,
+} from './rpcSync';
+export type { RpcLagReport, RpcLagOptions, RpcLagThresholds, LagSeverity, LedgerHeadSource } from './rpcSync';
 // TEMP-VERIFY-DISABLED (pre-existing syntax error unrelated to this change, restored after check): export { AutoRebalancer, runScheduledRebalancer } from './bots/autoRebalancer';
 
 // Governance SDK exports

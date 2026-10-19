@@ -55,6 +55,10 @@ pub const DEFAULT_MIN_WITHDRAW_SHARES: i128 = 1;
 /// instead of being stranded in the vault forever.
 pub const DUST_THRESHOLD: i128 = 1;
 
+// The contract's entrypoints are exported only when the vault itself is the
+// contract being deployed. The rebalance engine depends on this module's types
+// (and on nothing else here), and a wasm binary cannot export two contracts.
+#[cfg(feature = "yield-vault")]
 #[contractimpl]
 impl YieldVault {
     /// Initialize a new yield vault
@@ -122,6 +126,28 @@ impl YieldVault {
             (Symbol::new(&env, "vault_initialized"),),
             (admin, name, token_a, token_b, treasury),
         );
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
     }
 
     /// Deposit tokens into the vault
@@ -281,10 +307,14 @@ impl YieldVault {
             panic!("insufficient amount B");
         }
 
-        // Update user position
+        // Update user position. Withdrawing retires the part of the user's
+        // position that was outstanding, so it is also the moment their pending
+        // reward window restarts; record it so the UI can show pending rewards
+        // from the user's own last harvest rather than the vault-wide one.
         position.shares -= shares;
         position.deposited_amount_a -= withdraw_amount_a;
         position.deposited_amount_b -= withdraw_amount_b;
+        position.last_harvest = env.ledger().timestamp();
         env.storage().instance().set(&user, &position);
 
         // Update vault metrics and recompute TVL from the remaining balances.
@@ -333,8 +363,14 @@ impl YieldVault {
         (final_amount_a, final_amount_b)
     }
 
-    /// Auto-compound harvest and reinvestment
-    pub fn harvest(env: Env, _caller: Address) {
+    /// Auto-compound harvest and reinvestment.
+    ///
+    /// Harvesting compounds rewards into the vault's balances, which changes the
+    /// value backing every share. The vault-wide `metrics.last_harvest` records
+    /// the last time that happened; the caller's own `last_harvest` is recorded
+    /// too, so a user's pending-reward state is measured from the last harvest
+    /// they participated in instead of a timestamp shared by the whole vault.
+    pub fn harvest(env: Env, caller: Address) {
         Self::require_not_paused(&env);
 
         let vault_info = Self::get_vault_info(env.clone());
@@ -394,7 +430,22 @@ impl YieldVault {
 
             env.events().publish(
                 (Symbol::new(&env, "harvest"),),
-                (_caller, net_rewards_a, net_rewards_b, fee_a, fee_b),
+                (caller.clone(), net_rewards_a, net_rewards_b, fee_a, fee_b),
+            );
+        }
+
+        // Per-user harvest bookkeeping. Only an address that already holds a
+        // position is stamped: writing a position for a caller that has none
+        // would let anyone create instance-storage entries for arbitrary
+        // addresses, and there is no pending reward to reset for them anyway.
+        let mut position = Self::get_user_position(env.clone(), caller.clone());
+        if position.shares > 0 {
+            position.last_harvest = env.ledger().timestamp();
+            env.storage().instance().set(&caller, &position);
+
+            env.events().publish(
+                (Symbol::new(&env, "user_harvest"),),
+                (caller, position.last_harvest),
             );
         }
     }
@@ -776,7 +827,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
     use soroban_sdk::{
         token::{StellarAssetClient, TokenClient},
         Env, IntoVal, Symbol,
@@ -1118,8 +1169,113 @@ mod tests {
         assert_eq!(token_a_client.balance(&treasury), 0);
     }
 
-    // ─── Insurance Integration ────────────────────────────────────────────────
+    // ─── Per-user harvest tracking (Issue #116) ───────────────────────────────
 
+    #[test]
+    fn test_withdraw_stamps_user_last_harvest() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, _, _) =
+            setup(&env, 0, 0, 0);
+
+        env.ledger().set_timestamp(1_000);
+        mint_pair(&token_a_client, &token_b_client, &token_a_admin, &token_b_admin, &user, 1000, 1000);
+        vault.deposit(&user, &1000, &1000, &0);
+        assert_eq!(vault.get_user_position(&user).last_harvest, 1_000);
+
+        env.ledger().set_timestamp(5_500);
+        vault.withdraw(&user, &500, &0, &0);
+
+        let position = vault.get_user_position(&user);
+        assert_eq!(
+            position.last_harvest, 5_500,
+            "withdraw must stamp the withdrawing user's last harvest"
+        );
+        assert_eq!(position.shares, 1500, "partial exit keeps the remaining shares");
+    }
+
+    #[test]
+    fn test_full_exit_stamps_user_last_harvest() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, _, _) =
+            setup(&env, 0, 0, 0);
+
+        env.ledger().set_timestamp(1_000);
+        mint_pair(&token_a_client, &token_b_client, &token_a_admin, &token_b_admin, &user, 1000, 1000);
+        vault.deposit(&user, &1000, &1000, &0);
+
+        env.ledger().set_timestamp(9_000);
+        vault.withdraw(&user, &2000, &0, &0);
+
+        let position = vault.get_user_position(&user);
+        assert_eq!(position.shares, 0);
+        assert_eq!(position.last_harvest, 9_000);
+    }
+
+    #[test]
+    fn test_harvest_stamps_only_the_caller() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        // No harvest fee, so the vault needs no token balance to reinvest.
+        let (vault, token_a_client, token_b_client, token_a_admin, token_b_admin, user, admin, _) =
+            setup(&env, 0, 0, 0);
+        let other = Address::generate(&env);
+
+        env.ledger().set_timestamp(1_000);
+        mint_pair(&token_a_client, &token_b_client, &token_a_admin, &token_b_admin, &user, 1000, 1000);
+        mint_pair(&token_a_client, &token_b_client, &token_a_admin, &token_b_admin, &other, 100, 100);
+        vault.deposit(&user, &1000, &1000, &0);
+        vault.deposit(&other, &100, &100, &0);
+
+        env.ledger().set_timestamp(4_000);
+        vault.harvest(&user);
+
+        assert_eq!(
+            vault.get_user_position(&user).last_harvest,
+            4_000,
+            "harvest must stamp the caller's last harvest"
+        );
+        assert_eq!(
+            vault.get_user_position(&other).last_harvest,
+            1_000,
+            "another holder's last harvest is untouched by someone else's harvest"
+        );
+        assert_eq!(
+            vault.get_metrics().last_harvest,
+            4_000,
+            "the vault-wide harvest timestamp still advances"
+        );
+        // The admin never deposited, so harvesting on their behalf must not
+        // create a position record for them.
+        assert_eq!(vault.get_user_position(&admin).last_harvest, 0);
+    }
+
+    #[test]
+    fn test_harvest_does_not_create_position_for_non_holder() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (vault, _, _, _, _, _, _, _) = setup(&env, 0, 0, 0);
+        let stranger = Address::generate(&env);
+
+        env.ledger().set_timestamp(7_000);
+        vault.harvest(&stranger);
+
+        let position = vault.get_user_position(&stranger);
+        assert_eq!(position.shares, 0);
+        assert_eq!(
+            position.last_harvest, 0,
+            "a caller with no position must not get a harvest timestamp written"
+        );
+    }
+
+    // ─── Insurance Integration ────────────────────────────────────────────────
+    //
+    // These helpers were written as if they lived inside the contract's
+    // `impl YieldVault` block but were placed in the test module, where `Self`
+    // does not resolve. Wrapping them in an inherent impl keeps them compiled
+    // and callable from tests without exposing them as contract entrypoints.
+    impl YieldVault {
     /// One-click deposit + insurance purchase.
     ///
     /// Deposits tokens into the vault and simultaneously purchases an insurance
@@ -1221,5 +1377,6 @@ mod tests {
         } else {
             (false, 0)
         }
+    }
     }
 }

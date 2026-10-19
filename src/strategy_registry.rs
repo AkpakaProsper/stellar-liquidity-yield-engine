@@ -99,6 +99,28 @@ impl StrategyRegistry {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "strategy_params"), &strategy_params);
+        // Record the storage schema version of this build; `migrate` moves it
+        // forward after an upgrade swaps the code.
+        crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
+    }
+
+    /// Replace this contract's code in place, keeping its address and storage
+    /// (admin only). See [crate::upgrade] and `docs/UPGRADING.md`.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::update_wasm(&env, &admin, new_wasm_hash);
+    }
+
+    /// Storage schema version of this contract's stored data.
+    pub fn get_storage_version(env: Env) -> u32 {
+        crate::upgrade::storage_version(&env)
+    }
+
+    /// Adopt the storage schema version of this build (admin only, idempotent).
+    /// Returns the version that was replaced.
+    pub fn migrate(env: Env, admin: Address) -> u32 {
+        Self::require_admin(&env, admin.clone());
+        crate::upgrade::mark_migrated(&env, &admin)
     }
 
     /// Register a new yield strategy
@@ -329,11 +351,6 @@ impl StrategyRegistry {
             .unwrap_or_else(|| panic!("strategy not found"));
         strategy.is_active = false;
         strategy.updated_at = env.ledger().timestamp();
-                strategies.set(i, strategy);
-                found = true;
-                break;
-            }
-        }
 
         strategies.set(strategy_id, strategy);
         env.storage()
@@ -351,7 +368,8 @@ impl StrategyRegistry {
             approved_by: admin,
             approved_at: env.ledger().timestamp(),
             approval_type: 3, // Removal
-            comments: Symbol::new(&env, "Deactivated by admin"),
+            // `Symbol` only accepts [A-Za-z0-9_], so the label is a single word.
+            comments: Symbol::new(&env, "deactivated"),
         };
 
         Self::add_approval(&env, approval);
@@ -459,7 +477,7 @@ impl StrategyRegistry {
     }
 
     /// Paginated performance history with offset for bounded reads (Issue #107)
-    pub fn get_performance_history_paginated(
+    pub fn get_performance_history_page(
         env: Env,
         strategy_id: u32,
         limit: u32,

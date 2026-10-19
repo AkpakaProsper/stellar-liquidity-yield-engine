@@ -1,4 +1,6 @@
 import { ArbitrageScanner, ArbitrageExecutor, ArbitrageOptimizer, Opportunity } from '../arbitrage';
+import { LedgerHeadSource, RpcLagMonitor, RpcLagOptions, RpcLagReport } from '../rpcSync';
+import { SorobanRpc } from 'stellar-sdk';
 import axios from 'axios';
 
 export interface RebalancerConfig {
@@ -12,6 +14,13 @@ export interface RebalancerConfig {
   discordWebhookUrl?: string;
   riskTolerance: number; // 1-10
   maxPositionSize: bigint;
+  /**
+   * RPC ledger-head source. When set, the keeper checks the node's head against
+   * the last ledger it processed and warns before acting on stale data.
+   */
+  rpcHeadSource?: LedgerHeadSource;
+  /** Thresholds for the RPC lag warning. */
+  lagOptions?: RpcLagOptions;
 }
 
 export interface RebalanceResult {
@@ -20,6 +29,8 @@ export interface RebalanceResult {
   opportunity?: Opportunity;
   profit?: bigint;
   message: string;
+  /** RPC lag observed for this run, when a head source is configured. */
+  lag?: RpcLagReport;
 }
 
 export interface AutoRebalancerOptions {
@@ -35,16 +46,40 @@ export class AutoRebalancer {
   private executor: ArbitrageExecutor;
   private executionHistory: RebalanceResult[] = [];
   private lastExecutionTime: number = 0;
+  private lagMonitor?: RpcLagMonitor;
+  private lastLag?: RpcLagReport;
 
   constructor(config: RebalancerConfig, options: AutoRebalancerOptions = {}) {
     this.config = config;
     this.scanner = options.scanner ?? new ArbitrageScanner();
     this.executor = options.executor ?? new ArbitrageExecutor();
+    if (config.rpcHeadSource) {
+      this.lagMonitor = new RpcLagMonitor(config.rpcHeadSource, config.lagOptions);
+    }
   }
 
   /** Write-pacing counters for the executor this keeper writes through. */
   getWriteLimiterStats() {
     return this.executor.getWriteLimiterStats();
+  }
+
+  /**
+   * Check the RPC node's ledger head against the last ledger this keeper has
+   * processed, warning when the node is noticeably behind. Returns `undefined`
+   * when no head source is configured.
+   */
+  async checkRpcLag(): Promise<RpcLagReport | undefined> {
+    if (!this.lagMonitor) {
+      return undefined;
+    }
+    const report = await this.lagMonitor.check();
+    this.lastLag = report;
+    return report;
+  }
+
+  /** The most recent lag report, if a check has run. */
+  getLastLagReport(): RpcLagReport | undefined {
+    return this.lastLag;
   }
 
   /**
@@ -55,12 +90,25 @@ export class AutoRebalancer {
     const results: RebalanceResult[] = [];
 
     try {
+      // Warn before acting if the RPC node's head has fallen noticeably behind
+      // the last ledger this keeper processed.
+      const lag = await this.checkRpcLag();
+      if (lag && lag.severity !== 'ok') {
+        results.push({
+          timestamp: Date.now(),
+          success: false,
+          message: `RPC lag detected: ${lag.message}`,
+          lag,
+        });
+      }
+
       // Check cooldown
       if (!this.isReadyForRebalance()) {
         results.push({
           timestamp: Date.now(),
           success: false,
           message: `Cooldown active. Last execution: ${new Date(this.lastExecutionTime).toISOString()}`,
+          lag,
         });
         return results;
       }
@@ -77,6 +125,7 @@ export class AutoRebalancer {
           timestamp: Date.now(),
           success: false,
           message: 'No profitable opportunities found',
+          lag,
         });
         return results;
       }
@@ -136,6 +185,7 @@ export class AutoRebalancer {
           opportunity: bestOpportunity,
           profit: profitability.netProfit,
           message: `Rebalance executed successfully. TX: ${executionResult.transactionHash}`,
+          lag,
         };
         results.push(result);
         this.executionHistory.push(result);
@@ -148,6 +198,7 @@ export class AutoRebalancer {
           success: false,
           opportunity: bestOpportunity,
           message: `Execution failed: ${executionResult.error}`,
+          lag,
         });
       }
     } catch (error) {
@@ -261,6 +312,7 @@ Time: ${new Date(result.timestamp).toISOString()}
  * every 15 minutes, e.g. "/15 * * * *".
  */
 async function runScheduledRebalancer() {
+  const rpcUrl = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
   const config: RebalancerConfig = {
     vaultAddress: process.env.VAULT_ADDRESS || '',
     currentPoolId: process.env.CURRENT_POOL_ID || '',
@@ -272,6 +324,9 @@ async function runScheduledRebalancer() {
     discordWebhookUrl: process.env.DISCORD_WEBHOOK_URL,
     riskTolerance: parseInt(process.env.RISK_TOLERANCE || '5'),
     maxPositionSize: BigInt(process.env.MAX_POSITION_SIZE || '1000000000'),
+    // Watch the RPC node's ledger head so a lagging node is reported before
+    // the keeper acts on stale state.
+    rpcHeadSource: new SorobanRpc.Server(rpcUrl),
   };
 
   const rebalancer = new AutoRebalancer(config);
