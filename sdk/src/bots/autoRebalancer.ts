@@ -22,6 +22,13 @@ export interface RebalanceResult {
   message: string;
 }
 
+export interface AutoRebalancerOptions {
+  /** Override the opportunity scanner (defaults to a real Horizon-backed one). */
+  scanner?: ArbitrageScanner;
+  /** Override the executor, e.g. to configure its write pacing. */
+  executor?: ArbitrageExecutor;
+}
+
 export class AutoRebalancer {
   private config: RebalancerConfig;
   private scanner: ArbitrageScanner;
@@ -29,10 +36,15 @@ export class AutoRebalancer {
   private executionHistory: RebalanceResult[] = [];
   private lastExecutionTime: number = 0;
 
-  constructor(config: RebalancerConfig) {
+  constructor(config: RebalancerConfig, options: AutoRebalancerOptions = {}) {
     this.config = config;
-    this.scanner = new ArbitrageScanner();
-    this.executor = new ArbitrageExecutor();
+    this.scanner = options.scanner ?? new ArbitrageScanner();
+    this.executor = options.executor ?? new ArbitrageExecutor();
+  }
+
+  /** Write-pacing counters for the executor this keeper writes through. */
+  getWriteLimiterStats() {
+    return this.executor.getWriteLimiterStats();
   }
 
   /**
