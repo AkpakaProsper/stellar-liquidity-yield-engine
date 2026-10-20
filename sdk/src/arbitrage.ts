@@ -1,5 +1,6 @@
 import { Address, Horizon } from 'stellar-sdk';
 import axios from 'axios';
+import { WriteRateLimiter } from './utils/rateLimiter';
 
 export interface Opportunity {
   pool_id: string;
@@ -311,11 +312,28 @@ export class ArbitrageScanner {
   }
 }
 
+export interface ArbitrageExecutorOptions {
+  /**
+   * Paces transaction submissions so a burst of work does not trip the RPC
+   * node's rate limits. When omitted, a default limiter (one write at a time,
+   * 1s apart) is used.
+   */
+  writeLimiter?: WriteRateLimiter;
+}
+
 export class ArbitrageExecutor {
   private horizonServer: Horizon.Server;
+  private readonly writeLimiter: WriteRateLimiter;
 
-  constructor(horizonUrl: string = 'https://horizon.stellar.org') {
+  constructor(horizonUrl: string = 'https://horizon.stellar.org', options: ArbitrageExecutorOptions = {}) {
     this.horizonServer = new Horizon.Server(horizonUrl);
+    this.writeLimiter =
+      options.writeLimiter ?? new WriteRateLimiter({ minIntervalMs: 1000, maxConcurrent: 1 });
+  }
+
+  /** Write-pacing counters for this executor. */
+  getWriteLimiterStats() {
+    return this.writeLimiter.stats();
   }
 
   /**
@@ -369,22 +387,26 @@ export class ArbitrageExecutor {
         };
       }
 
-      // In production, this would:
-      // 1. Create multi-operation transaction (withdraw + deposit)
-      // 2. Sign with provided private key
-      // 3. Submit to network
-      // 4. Wait for confirmation
+      // Pace the submission: bursts of arbitrage are the most likely trigger
+      // for node-side throttling, so the actual write goes through the limiter.
+      return await this.writeLimiter.schedule(async () => {
+        // In production, this would:
+        // 1. Create multi-operation transaction (withdraw + deposit)
+        // 2. Sign with provided private key
+        // 3. Submit to network
+        // 4. Wait for confirmation
 
-      console.log(`Executing arbitrage: ${currentPoolId} -> ${opportunity.pool_id}`);
-      console.log(`Amount: ${amount}, Projected APY gain: ${opportunity.apy_delta} bp`);
+        console.log(`Executing arbitrage: ${currentPoolId} -> ${opportunity.pool_id}`);
+        console.log(`Amount: ${amount}, Projected APY gain: ${opportunity.apy_delta} bp`);
 
-      // Simulated successful execution
-      const txHash = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        // Simulated successful execution
+        const txHash = `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-      return {
-        success: true,
-        transactionHash: txHash,
-      };
+        return {
+          success: true,
+          transactionHash: txHash,
+        };
+      });
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       return {

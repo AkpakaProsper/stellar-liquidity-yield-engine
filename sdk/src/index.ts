@@ -27,6 +27,10 @@ export type { VolatilitySource, VolatilityMetrics, PoolMetrics, Opportunity } fr
 // with a contract call to `get_active_strategies`.
 export { StrategyRegistryClient } from './strategyRegistryClient';
 
+// Keeper write pacing: rate-limit transaction submissions to avoid throttling.
+export { WriteRateLimiter } from './utils/rateLimiter';
+export type { WriteRateLimiterOptions, WriteRateLimiterStats } from './utils/rateLimiter';
+
 // RPC synchronization: ledger-head lag detection for keepers.
 export {
   RpcLagMonitor,
