@@ -1,8 +1,7 @@
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, Symbol, Vec,
-    unwrap::UnwrapOptimized
-};
 use soroban_sdk::token::TokenClient;
+use soroban_sdk::{
+    contract, contractimpl, contracttype, unwrap::UnwrapOptimized, Address, Env, Map, Symbol, Vec,
+};
 
 /// The single vault call this engine makes.
 ///
@@ -28,9 +27,9 @@ pub struct PoolAllocation {
     pub pool_id: Address,
     pub token_a: Address,
     pub token_b: Address,
-    pub allocation_percent: u32, // Basis points (10000 = 100%)
-    pub target_apy: u32, // Basis points
-    pub current_apy: u32, // Basis points
+    pub allocation_percent: u32,    // Basis points (10000 = 100%)
+    pub target_apy: u32,            // Basis points
+    pub current_apy: u32,           // Basis points
     pub impermanent_loss_risk: u32, // Basis points
 }
 
@@ -39,9 +38,9 @@ pub struct PoolAllocation {
 pub struct RebalanceStrategy {
     pub strategy_id: u32,
     pub name: Symbol,
-    pub risk_level: u32, // 1=Conservative, 2=Balanced, 3=Aggressive
-    pub min_apy_threshold: u32, // Basis points
-    pub max_il_risk: u32, // Basis points
+    pub risk_level: u32,          // 1=Conservative, 2=Balanced, 3=Aggressive
+    pub min_apy_threshold: u32,   // Basis points
+    pub max_il_risk: u32,         // Basis points
     pub rebalance_frequency: u64, // Seconds
     pub allocations: Vec<PoolAllocation>,
 }
@@ -75,11 +74,11 @@ pub struct RebalanceHistory {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArbitrageOpportunity {
     pub pool_id: Address,
-    pub current_apy: u32, // Basis points
+    pub current_apy: u32,   // Basis points
     pub projected_apy: u32, // Basis points after rebalance
-    pub il_risk: u32, // Basis points
-    pub net_profit: i128, // In native token units
-    pub apy_delta: u32, // Difference in basis points
+    pub il_risk: u32,       // Basis points
+    pub net_profit: i128,   // In native token units
+    pub apy_delta: u32,     // Difference in basis points
     pub recommended: bool,
 }
 
@@ -100,8 +99,8 @@ pub struct ArbitrageThresholds {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolApyRecord {
-    pub apy_bps: u32, // Observed APY in basis points (10000 = 100%)
-    pub updated_at: u64, // Ledger timestamp the feed was refreshed
+    pub apy_bps: u32,        // Observed APY in basis points (10000 = 100%)
+    pub updated_at: u64,     // Ledger timestamp the feed was refreshed
     pub updated_by: Address, // Admin or keeper that pushed the observation
 }
 
@@ -112,17 +111,27 @@ pub struct RebalanceEngine;
 impl RebalanceEngine {
     /// Initialize the rebalance engine
     pub fn initialize(env: Env, admin: Address) {
-        env.storage().instance().set(&Symbol::new(&env, "admin"), &admin);
-        env.storage().instance().set(&Symbol::new(&env, "paused"), &false);
-        env.storage().instance().set(&Symbol::new(&env, "next_strategy_id"), &1u32);
-        
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "admin"), &admin);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &false);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "next_strategy_id"), &1u32);
+
         // Initialize empty strategy registry as Map for O(1) access (Issue #108)
         let strategies: Map<u32, RebalanceStrategy> = Map::new(&env);
-        env.storage().instance().set(&Symbol::new(&env, "strategies"), &strategies);
-        
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "strategies"), &strategies);
+
         // Initialize empty history
         let history: Vec<RebalanceHistory> = Vec::new(&env);
-        env.storage().instance().set(&Symbol::new(&env, "history"), &history);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "history"), &history);
 
         // Initialize the APY registry, the keeper set and the staleness bound
         // (Issue #105).
@@ -177,7 +186,7 @@ impl RebalanceEngine {
         Self::validate_allocations(&allocations);
 
         let strategy_id = Self::get_next_strategy_id(&env);
-        
+
         let strategy = RebalanceStrategy {
             strategy_id,
             name: name.clone(),
@@ -189,9 +198,11 @@ impl RebalanceEngine {
         };
 
         let mut strategies = Self::get_strategies_map(env.clone());
-        require!(risk_level >= 1 && risk_level <= 3, "risk_level must be 1-3");
+        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
         strategies.set(strategy_id, strategy.clone());
-        env.storage().instance().set(&Symbol::new(&env, "strategies"), &strategies);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "strategies"), &strategies);
 
         env.events().publish(
             (Symbol::new(&env, "rebalance_strategy_created"), strategy_id),
@@ -216,7 +227,7 @@ impl RebalanceEngine {
         Self::require_admin(&env, admin.clone());
         Self::require_not_paused(&env);
         Self::validate_allocations(&allocations);
-        require!(risk_level >= 1 && risk_level <= 3, "risk_level must be 1-3");
+        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
 
         let mut strategies = Self::get_strategies_map(env.clone());
         if strategies.get(strategy_id).is_none() {
@@ -232,7 +243,9 @@ impl RebalanceEngine {
             allocations,
         };
         strategies.set(strategy_id, updated_strategy);
-        env.storage().instance().set(&Symbol::new(&env, "strategies"), &strategies);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "strategies"), &strategies);
 
         env.events().publish(
             (Symbol::new(&env, "rebalance_strategy_updated"), strategy_id),
@@ -241,10 +254,7 @@ impl RebalanceEngine {
     }
 
     /// Analyze current pool conditions and generate rebalance proposals
-    pub fn analyze_rebalance_opportunities(
-        env: Env,
-        strategy_id: u32,
-    ) -> Vec<RebalanceProposal> {
+    pub fn analyze_rebalance_opportunities(env: Env, strategy_id: u32) -> Vec<RebalanceProposal> {
         Self::require_not_paused(&env);
 
         let strategy = Self::get_strategy(env.clone(), strategy_id);
@@ -260,8 +270,9 @@ impl RebalanceEngine {
             // Check if rebalancing is needed
             if current_apy < target_apy - strategy.min_apy_threshold {
                 // Find better pools
-                let better_pools = Self::find_better_pools(&env, &allocation, &strategy, current_apy);
-                
+                let better_pools =
+                    Self::find_better_pools(&env, &allocation, &strategy, current_apy);
+
                 for better_pool in better_pools {
                     let proposal = RebalanceProposal {
                         from_pool: allocation.pool_id.clone(),
@@ -281,11 +292,7 @@ impl RebalanceEngine {
     }
 
     /// Execute a rebalance proposal
-    pub fn execute_rebalance(
-        env: Env,
-        caller: Address,
-        proposal: RebalanceProposal,
-    ) -> bool {
+    pub fn execute_rebalance(env: Env, _caller: Address, proposal: RebalanceProposal) -> bool {
         Self::require_not_paused(&env);
 
         // Verify caller is authorized (could be a vault or authorized manager)
@@ -391,7 +398,8 @@ impl RebalanceEngine {
             return Vec::new(&env);
         }
 
-        let history: Vec<RebalanceHistory> = env.storage()
+        let history: Vec<RebalanceHistory> = env
+            .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
             .unwrap_optimized();
@@ -412,7 +420,8 @@ impl RebalanceEngine {
 
     /// Paginated history with limit/offset for bounded reads (Issue #107)
     pub fn get_history_paginated(env: Env, limit: u32, offset: u32) -> Vec<RebalanceHistory> {
-        let history: Vec<RebalanceHistory> = env.storage()
+        let history: Vec<RebalanceHistory> = env
+            .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
             .unwrap_optimized();
@@ -428,7 +437,8 @@ impl RebalanceEngine {
     }
 
     pub fn get_history_count(env: Env) -> u32 {
-        let h: Vec<RebalanceHistory> = env.storage()
+        let h: Vec<RebalanceHistory> = env
+            .storage()
             .instance()
             .get(&Symbol::new(&env, "history"))
             .unwrap_optimized();
@@ -554,9 +564,9 @@ impl RebalanceEngine {
     /// integer division never truncates intermediate terms (avoiding the
     /// discontinuous results of the previous `diff^2 / initial^2` approximation).
     pub fn calculate_impermanent_loss(
-        env: Env,
-        pool_id: Address,
-        price_ratio: i128, // Current price ratio * 10000
+        _env: Env,
+        _pool_id: Address,
+        price_ratio: i128,         // Current price ratio * 10000
         initial_price_ratio: i128, // Initial price ratio * 10000
     ) -> u32 {
         if price_ratio <= 0 || initial_price_ratio <= 0 {
@@ -564,7 +574,7 @@ impl RebalanceEngine {
         }
 
         // r scaled by 10000: (current / entry) * 10000
-        let r_scaled = (price_ratio as i128 * 10000) / initial_price_ratio;
+        let r_scaled = (price_ratio * 10000) / initial_price_ratio;
 
         // sqrt(r) scaled by 10000 = sqrt(r_scaled * 10000)
         let sqrt_r_scaled = Self::isqrt((r_scaled as u128) * 10000);
@@ -576,7 +586,7 @@ impl RebalanceEngine {
 
         // By AM-GM, 1 + r >= 2 * sqrt(r), so term <= 10000 always and
         // `10000 - term` can never underflow. IL rises as the price diverges.
-        let il_bp = if term >= 10000 { 0 } else { 10000 - term };
+        let il_bp = 10000_u128.saturating_sub(term);
         il_bp.min(10000) as u32
     }
 
@@ -586,7 +596,7 @@ impl RebalanceEngine {
             return n;
         }
         let mut x = n;
-        let mut y = (x + 1) / 2;
+        let mut y = x.div_ceil(2);
         while y < x {
             x = y;
             y = (x + n / x) / 2;
@@ -596,11 +606,14 @@ impl RebalanceEngine {
 
     /// Helper functions
     fn get_next_strategy_id(env: &Env) -> u32 {
-        let id: u32 = env.storage()
+        let id: u32 = env
+            .storage()
             .instance()
             .get(&Symbol::new(env, "next_strategy_id"))
             .unwrap_optimized();
-        env.storage().instance().set(&Symbol::new(env, "next_strategy_id"), &(id + 1));
+        env.storage()
+            .instance()
+            .set(&Symbol::new(env, "next_strategy_id"), &(id + 1));
         id
     }
 
@@ -639,7 +652,7 @@ impl RebalanceEngine {
         current_apy: u32,
     ) -> Vec<PoolAllocation> {
         let mut better_pools: Vec<PoolAllocation> = Vec::new(env);
-        
+
         // Only return pools already registered in the strategy allocations.
         // Each candidate APY is resolved through the oracle first so a stale
         // snapshot in the strategy cannot hide (or invent) an opportunity.
@@ -659,11 +672,7 @@ impl RebalanceEngine {
         better_pools
     }
 
-    fn estimate_rebalance_amount(_env: &Env, _pool_id: &Address) -> i128 {
-        0
-    }
-
-    fn estimate_gas_cost(env: &Env) -> i128 {
+    fn estimate_gas_cost(_env: &Env) -> i128 {
         // Estimate gas cost for rebalance transaction
         50000i128
     }
@@ -707,13 +716,14 @@ impl RebalanceEngine {
     }
 
     fn add_to_history(env: &Env, entry: RebalanceHistory) {
-        let mut history: Vec<RebalanceHistory> = env.storage()
+        let mut history: Vec<RebalanceHistory> = env
+            .storage()
             .instance()
             .get(&Symbol::new(env, "history"))
             .unwrap_optimized();
-        
+
         history.push_back(entry);
-        
+
         // Keep only last 1000 entries
         if history.len() > 1000 {
             let start = history.len() - 1000;
@@ -721,9 +731,13 @@ impl RebalanceEngine {
             for i in start..history.len() {
                 trimmed.push_back(history.get(i).unwrap());
             }
-            env.storage().instance().set(&Symbol::new(env, "history"), &trimmed);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(env, "history"), &trimmed);
         } else {
-            env.storage().instance().set(&Symbol::new(env, "history"), &history);
+            env.storage()
+                .instance()
+                .set(&Symbol::new(env, "history"), &history);
         }
     }
 
@@ -777,7 +791,9 @@ impl RebalanceEngine {
     /// Pause rebalance engine (admin only)
     pub fn pause(env: Env, admin: Address) {
         Self::require_admin(&env, admin.clone());
-        env.storage().instance().set(&Symbol::new(&env, "paused"), &true);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &true);
         env.events()
             .publish((Symbol::new(&env, "rebalance_paused"),), (admin,));
     }
@@ -785,7 +801,9 @@ impl RebalanceEngine {
     /// Unpause rebalance engine (admin only)
     pub fn unpause(env: Env, admin: Address) {
         Self::require_admin(&env, admin.clone());
-        env.storage().instance().set(&Symbol::new(&env, "paused"), &false);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "paused"), &false);
         env.events()
             .publish((Symbol::new(&env, "rebalance_unpaused"),), (admin,));
     }
@@ -801,14 +819,16 @@ impl RebalanceEngine {
         cooldown_period: u64,
     ) {
         Self::require_admin(&env, admin.clone());
-        
+
         let thresholds = ArbitrageThresholds {
             min_apy_delta,
             max_il_tolerance,
             cooldown_period,
         };
-        
-        env.storage().instance().set(&Symbol::new(&env, "arbitrage_thresholds"), &thresholds);
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "arbitrage_thresholds"), &thresholds);
 
         env.events().publish(
             (Symbol::new(&env, "thresholds_updated"),),
@@ -822,8 +842,8 @@ impl RebalanceEngine {
             .instance()
             .get(&Symbol::new(&env, "arbitrage_thresholds"))
             .unwrap_or(ArbitrageThresholds {
-                min_apy_delta: 200u32, // Default 2%
-                max_il_tolerance: 100u32, // Default 1%
+                min_apy_delta: 200u32,     // Default 2%
+                max_il_tolerance: 100u32,  // Default 1%
                 cooldown_period: 86400u64, // Default 24 hours
             })
     }
@@ -837,7 +857,7 @@ impl RebalanceEngine {
         available_pools: Vec<PoolAllocation>, // List of all available pools
     ) -> Vec<ArbitrageOpportunity> {
         Self::require_not_paused(&env);
-        
+
         let thresholds = Self::get_arbitrage_thresholds(env.clone());
         let mut opportunities: Vec<ArbitrageOpportunity> = Vec::new(&env);
 
@@ -852,9 +872,12 @@ impl RebalanceEngine {
             let apy_delta = pool_apy.saturating_sub(vault_apy);
 
             // Check if opportunity meets minimum APY delta threshold
-            if apy_delta >= thresholds.min_apy_delta && pool.impermanent_loss_risk <= thresholds.max_il_tolerance {
+            if apy_delta >= thresholds.min_apy_delta
+                && pool.impermanent_loss_risk <= thresholds.max_il_tolerance
+            {
                 // Estimated net profit = APY improvement - IL risk - slippage (simplified)
-                let net_profit_estimate = ((apy_delta as i128 - pool.impermanent_loss_risk as i128) * 1000000) / 10000;
+                let net_profit_estimate =
+                    ((apy_delta as i128 - pool.impermanent_loss_risk as i128) * 1000000) / 10000;
 
                 let opportunity = ArbitrageOpportunity {
                     pool_id: pool.pool_id,
@@ -880,9 +903,9 @@ impl RebalanceEngine {
     /// `expected_profit - total_cost` and `is_profitable` is true when the net
     /// profit is strictly greater than zero.
     pub fn calculate_rebalance_cost(
-        env: Env,
-        from_pool: Address,
-        to_pool: Address,
+        _env: Env,
+        _from_pool: Address,
+        _to_pool: Address,
         amount: i128,
         gas_estimate: i128,
         il_basis_points: u32,
@@ -891,10 +914,10 @@ impl RebalanceEngine {
     ) -> (i128, i128, bool) {
         // IL cost in absolute terms
         let il_cost = (amount * il_basis_points as i128) / 10000;
-        
+
         // Entry fee cost
         let entry_cost = (amount * entry_fee_basis_points as i128) / 10000;
-        
+
         // Total cost = gas + IL + entry fees (slippage estimated at 10 bp)
         let slippage_cost = (amount * 10i128) / 10000;
         let total_cost = gas_estimate + il_cost + entry_cost + slippage_cost;
@@ -911,7 +934,9 @@ impl RebalanceEngine {
     /// Timestamp of the last successful rebalance for a vault, or 0 if the vault
     /// has never rebalanced.
     pub fn get_vault_last_rebalance_time(env: Env, vault_id: Address) -> u64 {
-        Self::get_last_rebalance_times(env).get(vault_id).unwrap_or(0u64)
+        Self::get_last_rebalance_times(env)
+            .get(vault_id)
+            .unwrap_or(0u64)
     }
 
     /// Seconds until the vault is allowed to rebalance again. Returns 0 when the
@@ -946,7 +971,7 @@ impl RebalanceEngine {
         times.set(vault_id.clone(), env.ledger().timestamp());
         env.storage()
             .instance()
-            .set(&Symbol::new(&env, "vault_last_rebalance_times"), &times);
+            .set(&Symbol::new(env, "vault_last_rebalance_times"), &times);
 
         env.events().publish(
             (Symbol::new(env, "vault_rebalanced"), vault_id),
@@ -958,7 +983,7 @@ impl RebalanceEngine {
     /// Cooldown is tracked per vault so one vault's rebalance does not block others.
     pub fn execute_flash_rebalance(
         env: Env,
-        caller: Address,
+        _caller: Address,
         vault_id: Address,
         opportunity: ArbitrageOpportunity,
         amount: i128,
@@ -1017,18 +1042,16 @@ impl RebalanceEngine {
     }
 
     /// Track arbitrage performance and enforce emergency stop
-    pub fn check_emergency_stop(
-        env: Env,
-    ) -> bool {
+    pub fn check_emergency_stop(env: Env) -> bool {
         // Get last 3 rebalance results
         let history = Self::get_history(env.clone(), 3u32);
-        
+
         // Trigger emergency stop if last 3 rebalances all resulted in loss
         if history.len() == 3 {
             let all_losses = !history.get(0).unwrap().success
                 && !history.get(1).unwrap().success
                 && !history.get(2).unwrap().success;
-            
+
             if all_losses {
                 let admin = Self::get_admin(env.clone());
                 Self::pause(env, admin);
@@ -1048,8 +1071,6 @@ mod tests {
     use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::{Env, Symbol, Vec};
 
-    use crate::YieldVault;
-
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         let pool = Address::generate(env);
         RebalanceEngine::calculate_impermanent_loss(env.clone(), pool, current, entry)
@@ -1062,13 +1083,13 @@ mod tests {
         assert_eq!(il(&env, 10000, 10000), 0);
         // r=2 => ~572 bp
         let v = il(&env, 20000, 10000);
-        assert!(v >= 560 && v <= 590, "r=2 got {}", v);
+        assert!((560..=590).contains(&v), "r=2 got {}", v);
         // r=4 => 2000 bp
         let v4 = il(&env, 40000, 10000);
-        assert!(v4 >= 1985 && v4 <= 2015, "r=4 got {}", v4);
+        assert!((1985..=2015).contains(&v4), "r=4 got {}", v4);
         // symmetric r=0.5
         let vh = il(&env, 5000, 10000);
-        assert!(vh >= 560 && vh <= 590, "r=0.5 got {}", vh);
+        assert!((560..=590).contains(&vh), "r=0.5 got {}", vh);
     }
 
     #[test]
@@ -1083,7 +1104,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
         let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, RebalanceEngine);
+        let contract_id = env.register(RebalanceEngine, ());
         let client = RebalanceEngineClient::new(&env, &contract_id);
         client.initialize(&admin);
         let alloc = Vec::from_array(
@@ -1098,7 +1119,15 @@ mod tests {
                 impermanent_loss_risk: 100,
             }],
         );
-        let sid = client.create_strategy(&admin, &Symbol::new(&env, "Test"), &1, &100, &500, &3600, &alloc);
+        let sid = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Test"),
+            &1,
+            &100,
+            &500,
+            &3600,
+            &alloc,
+        );
         assert_eq!(sid, 1);
         let fetched = client.get_strategy(&1);
         assert_eq!(fetched.strategy_id, 1);
@@ -1115,7 +1144,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
         let admin = Address::generate(&env);
-        let contract_id = env.register_contract(None, RebalanceEngine);
+        let contract_id = env.register(RebalanceEngine, ());
         let client = RebalanceEngineClient::new(&env, &contract_id);
         client.initialize(&admin);
         // push 5 histories via execute_rebalance with failing proposals? Instead directly test paginated getter on empty
@@ -1131,7 +1160,7 @@ mod tests {
     fn engine(env: &Env) -> (RebalanceEngineClient<'static>, Address) {
         env.mock_all_auths_allowing_non_root_auth();
         let admin = Address::generate(env);
-        let contract_id = env.register_contract(None, RebalanceEngine);
+        let contract_id = env.register(RebalanceEngine, ());
         let client = RebalanceEngineClient::new(env, &contract_id);
         client.initialize(&admin);
         (client, admin)
