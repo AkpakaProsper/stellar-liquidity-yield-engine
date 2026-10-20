@@ -38,7 +38,16 @@ export {
   DEFAULT_CRITICAL_LEDGERS,
   LEDGER_CLOSE_TIME_SECONDS,
 } from './rpcSync';
-export type { RpcLagReport, RpcLagOptions, RpcLagThresholds, LagSeverity, LedgerHeadSource } from './rpcSync';
+export type { RpcLagReport, RpcLagOptions, RpcLagThresholds, LagSeverity, LedgerHeadSource, RpcLagMonitorOptions } from './rpcSync';
+
+// Keeper health metrics for ops monitoring.
+export { KeeperMetrics, KEEPER_METRICS_PREFIX, } from './keeperMetrics';
+export type {
+  KeeperMetricsSnapshot,
+  KeeperMetricsOptions,
+  MetricSample,
+  MetricType,
+} from './keeperMetrics';
 
 // Address-filtered contract event listener for off-chain keepers.
 // Operators running multiple contracts can restrict a single listener to only
@@ -119,7 +128,7 @@ function contractsFromEnv() {
 // Network configurations
 //
 // Public endpoints are only defaults: every one of them can be pointed at a
-// custom RPC via the environment, which is what `SOROBAN_RPC_URL` /
+// custom RPC via the environment, which is what `Soroban_RPC_URL` /
 // `HORIZON_URL` in `.env.example` are for. See `.emdfile` for the convention.
 export const TESTNET_CONFIG = {
   network: 'testnet' as const,
