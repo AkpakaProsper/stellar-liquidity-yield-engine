@@ -366,6 +366,36 @@ export class RebalancerClient {
   }
 
   /**
+   * Check if a pool's APY observation is still fresh (within the configured maximum age).
+   *
+   * Returns true when the pool has an observation that is still within the
+   * configured maximum age, false otherwise.
+   */
+  async isApyFresh(poolId: Address): Promise<boolean> {
+    try {
+      const result = await this.server.simulateTransaction(
+        new TransactionBuilder(
+          await this.server.getAccount('GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'),
+          {
+            fee: BASE_FEE,
+            networkPassphrase: this.getNetworkPassphrase()
+          }
+        )
+          .addOperation(this.contract.call('is_apy_fresh', poolId.toString()))
+          .build()
+      );
+
+      if (result.result?.status !== 'SUCCESS') {
+        throw new Error('Failed to check APY freshness');
+      }
+
+      return Boolean(scValToNative(result.result.returnValue));
+    } catch (error: any) {
+      throw new RebalanceError(`Freshness check failed: ${error.message}`, 'FRESHNESS_CHECK_ERROR');
+    }
+  }
+
+  /**
    * Calculate impermanent loss for a pool
    */
   async calculateImpermanentLoss(
