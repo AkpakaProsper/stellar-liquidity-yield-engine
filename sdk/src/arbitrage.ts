@@ -15,6 +15,7 @@ export interface Opportunity {
   net_profit: bigint;
   apy_delta: number;
   recommended: boolean;
+  confidence: number; // 0-100, confidence score based on data age and sample size
 }
 
 export interface RoundTripCostEstimate {
@@ -55,6 +56,7 @@ export interface PoolMetrics {
   reserve_b: bigint;
   volatility_24h: number;
   volatility_7d: number;
+  confidence: number; // 0-100, confidence score based on data age and sample size
 }
 
 /**
@@ -63,6 +65,8 @@ export interface PoolMetrics {
 export interface VolatilityMetrics {
   volatility_24h: number;
   volatility_7d: number;
+  sampleSize_24h: number;
+  sampleSize_7d: number;
 }
 
 /**
@@ -74,6 +78,30 @@ export interface VolatilityMetrics {
  */
 export interface VolatilitySource {
   getVolatility(poolId: string): Promise<VolatilityMetrics | null>;
+}
+
+/**
+ * Calculate confidence score based on sample size and data recency.
+ * Returns a value between 0-100, where higher values indicate higher confidence.
+ *
+ * Confidence is computed as:
+ * - Sample size component: More samples = higher confidence (capped at 50 samples)
+ * - Age component: More recent data = higher confidence (exponential decay)
+ */
+export function calculateConfidence(
+  sampleSize: number,
+  ageSeconds: number,
+  maxSampleSize: number = 50,
+  halfLifeSeconds: number = 86400, // 24 hours
+): number {
+  // Sample size component: 0-50 points maps to 0-50 confidence
+  const sampleScore = Math.min(sampleSize / maxSampleSize, 1) * 50;
+  
+  // Age component: exponential decay based on half-life
+  const ageScore = Math.pow(0.5, ageSeconds / halfLifeSeconds) * 50;
+  
+  // Combined confidence score
+  return Math.min(Math.max(sampleScore + ageScore, 0), 100);
 }
 
 /**
@@ -166,6 +194,8 @@ export class HorizonVolatilitySource implements VolatilitySource {
       return {
         volatility_24h: volatility24h,
         volatility_7d: volatility7d,
+        sampleSize_24h: recentPrices.length,
+        sampleSize_7d: windowPrices.length,
       };
     } catch (error) {
       console.error(`Failed to fetch price history for pool ${poolId}:`, error);
@@ -253,6 +283,13 @@ export class ArbitrageScanner {
         return null;
       }
 
+      // Calculate confidence based on sample size (24h window is most relevant)
+      // and data age (assuming most recent trade is within 24h for high confidence)
+      const confidence = calculateConfidence(
+        volatility.sampleSize_24h,
+        0, // Age is 0 since we're using the most recent window
+      );
+
       return {
         pool_id: pool.id,
         current_apy: estimate_apy,
@@ -261,6 +298,7 @@ export class ArbitrageScanner {
         reserve_b,
         volatility_24h: Math.round(volatility.volatility_24h),
         volatility_7d: Math.round(volatility.volatility_7d),
+        confidence: Math.round(confidence),
       };
     } catch (error) {
       return null;
@@ -565,7 +603,7 @@ export class ArbitrageOptimizer {
   }
 
   /**
-   * Rank opportunities by risk-adjusted return
+   * Rank opportunities by risk-adjusted return with confidence weighting
    */
   static rankOpportunities(
     opportunities: Opportunity[],

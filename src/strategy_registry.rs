@@ -137,8 +137,11 @@ impl StrategyRegistry {
     ) -> u32 {
         Self::require_not_paused(&env);
         require!(min_investment > 0, "min investment must be positive");
-        require!(max_investment >= min_investment, "max investment must be greater than or equal to min investment");
-        
+        require!(
+            max_investment >= min_investment,
+            "max investment must be greater than or equal to min investment"
+        );
+
         let strategy_id = Self::get_next_strategy_id(&env);
         let current_time = env.ledger().timestamp();
 
@@ -160,8 +163,11 @@ impl StrategyRegistry {
         // O(1) insert into Map keyed by strategy_id
         let mut strategies = Self::get_strategies_map(&env);
         // Validate risk_level bounds (1-3) per issue #118
-        require!(risk_level >= 1 && risk_level <= 3, "risk_level must be 1-3");
-        require!(strategies.get(strategy_id).is_none(), "strategy id collision");
+        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
+        require!(
+            strategies.get(strategy_id).is_none(),
+            "strategy id collision"
+        );
         strategies.set(strategy_id, strategy.clone());
         env.storage()
             .instance()
@@ -231,8 +237,11 @@ impl StrategyRegistry {
     ) {
         Self::require_not_paused(&env);
         require!(min_investment > 0, "min investment must be positive");
-        require!(max_investment >= min_investment, "max investment must be greater than or equal to min investment");
-        
+        require!(
+            max_investment >= min_investment,
+            "max investment must be greater than or equal to min investment"
+        );
+
         let mut strategies = Self::get_strategies_map(&env);
         let strategy = strategies
             .get(strategy_id)
@@ -240,7 +249,7 @@ impl StrategyRegistry {
         if strategy.creator != creator {
             panic!("unauthorized: not strategy creator");
         }
-        require!(risk_level >= 1 && risk_level <= 3, "risk_level must be 1-3");
+        require!((1..=3).contains(&risk_level), "risk_level must be 1-3");
 
         let updated_strategy = YieldStrategy {
             strategy_id,
@@ -306,7 +315,7 @@ impl StrategyRegistry {
         if strategy.performance_history.len() > 100 {
             let total_records = strategy.performance_history.len();
             let start = total_records - 100;
-            let records_trimmed = start as u32;
+            let records_trimmed = start;
             let mut trimmed: Vec<PerformanceRecord> = Vec::new(&env);
             for j in start..total_records {
                 trimmed.push_back(strategy.performance_history.get(j).unwrap());
@@ -418,13 +427,22 @@ impl StrategyRegistry {
     }
 
     /// Get active strategies paginated
-    pub fn get_active_strategies_paginated(env: Env, limit: u32, offset: u32) -> Vec<YieldStrategy> {
+    pub fn get_active_strategies_paginated(
+        env: Env,
+        limit: u32,
+        offset: u32,
+    ) -> Vec<YieldStrategy> {
         let active = Self::get_active_strategies(env.clone());
         Self::paginate_vec(env.clone(), active, limit, offset)
     }
 
     /// Get strategies by risk paginated
-    pub fn get_strategies_by_risk_paginated(env: Env, risk_level: u32, limit: u32, offset: u32) -> Vec<YieldStrategy> {
+    pub fn get_strategies_by_risk_paginated(
+        env: Env,
+        risk_level: u32,
+        limit: u32,
+        offset: u32,
+    ) -> Vec<YieldStrategy> {
         let filtered = Self::get_strategies_by_risk(env.clone(), risk_level);
         Self::paginate_vec(env.clone(), filtered, limit, offset)
     }
@@ -434,7 +452,12 @@ impl StrategyRegistry {
         Self::get_strategies_map(&env).len()
     }
 
-    fn paginate_vec(env: Env, vec: Vec<YieldStrategy>, limit: u32, offset: u32) -> Vec<YieldStrategy> {
+    fn paginate_vec(
+        env: Env,
+        vec: Vec<YieldStrategy>,
+        limit: u32,
+        offset: u32,
+    ) -> Vec<YieldStrategy> {
         if limit == 0 || offset as usize >= vec.len() as usize {
             return Vec::new(&env);
         }
@@ -520,7 +543,7 @@ impl StrategyRegistry {
         let mut total_apy = 0u32;
         let mut total_volatility = 0u32;
         let mut total_sharpe = 0u32;
-        let count = strategy.performance_history.len() as u32;
+        let count = strategy.performance_history.len();
 
         for record in strategy.performance_history {
             total_apy += record.net_apy;
@@ -674,10 +697,10 @@ mod tests {
         }
     }
 
-    fn setup(env: &Env) -> (Address, Address, StrategyRegistryClient) {
+    fn setup(env: &Env) -> (Address, Address, StrategyRegistryClient<'_>) {
         let admin = Address::generate(env);
         let creator = Address::generate(env);
-        let contract_id = env.register_contract(None, StrategyRegistry);
+        let contract_id = env.register(StrategyRegistry, ());
         let client = StrategyRegistryClient::new(env, &contract_id);
         client.initialize(&admin);
         (admin, creator, client)

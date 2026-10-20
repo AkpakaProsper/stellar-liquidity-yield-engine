@@ -1,6 +1,6 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol,
-    token::TokenClient, unwrap::UnwrapOptimized,
+    contract, contractimpl, contracttype, token::TokenClient, unwrap::UnwrapOptimized, Address,
+    Env, Symbol,
 };
 
 /// Duration options for coverage period in seconds
@@ -134,20 +134,18 @@ impl ILInsurance {
 
         // Duration factor: scale premium by sqrt of time ratio vs 30d baseline
         // result is scaled by 1000
-        let duration_factor = Self::sqrt_scaled(
-            (coverage_period as i128 * 1000) / COVERAGE_30D as i128,
-        );
+        let duration_factor =
+            Self::sqrt_scaled((coverage_period as i128 * 1000) / COVERAGE_30D as i128);
 
         // Volatility adjustment
         let vol_factor = historical_volatility_bps as i128;
 
         // Correlation reduces effective IL
-        let correlation_adjusted =
-            vol_factor * (10000 - pool_correlation_bps as i128) / 10000;
+        let correlation_adjusted = vol_factor * (10000 - pool_correlation_bps as i128) / 10000;
 
         // Base effective rate in basis points
-        let mut effective_rate_bps = BASE_PREMIUM_BPS as i128
-            + (correlation_adjusted * duration_factor / 100_000);
+        let mut effective_rate_bps =
+            BASE_PREMIUM_BPS as i128 + (correlation_adjusted * duration_factor / 100_000);
 
         // Dynamic pricing: if reserve ratio < 150%, increase premiums
         let reserve_ratio = Self::compute_reserve_ratio(&reserve);
@@ -213,11 +211,7 @@ impl ILInsurance {
 
         // Transfer premium from buyer to reserve
         let token_client = TokenClient::new(&env, &reserve_token);
-        token_client.transfer(
-            &buyer,
-            &env.current_contract_address(),
-            &premium_amount,
-        );
+        token_client.transfer(&buyer, &env.current_contract_address(), &premium_amount);
 
         // Emit policy (increment policy counter)
         let policy_id = Self::next_policy_id(&env);
@@ -321,11 +315,7 @@ impl ILInsurance {
 
         if payout > 0 {
             let token_client = TokenClient::new(&env, &policy.coverage_token);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &claimant,
-                &payout,
-            );
+            token_client.transfer(&env.current_contract_address(), &claimant, &payout);
 
             reserve.total_claims_paid += payout;
             reserve.current_reserve -= payout;
@@ -424,17 +414,30 @@ mod test {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
+    /// Deploy and initialize the insurance contract. Storage is only readable
+    /// from inside a contract, so entrypoints are exercised through the
+    /// generated client rather than called as plain functions on `Env`.
+    fn setup(env: &Env) -> ILInsuranceClient<'_> {
+        let admin = Address::generate(env);
+        let reserve_token = Address::generate(env);
+        let contract_id = env.register(ILInsurance, ());
+        let client = ILInsuranceClient::new(env, &contract_id);
+        client.initialize(&admin, &reserve_token);
+        client
+    }
+
     #[test]
     fn test_calculate_premium_basic() {
         let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup(&env);
         let coverage_amount = 1_000_000i128;
 
-        let quote = ILInsurance::calculate_premium(
-            env,
-            coverage_amount,
-            COVERAGE_30D,
-            8000, // 80% annual vol
-            5000, // 50% correlation
+        let quote = client.calculate_premium(
+            &coverage_amount,
+            &COVERAGE_30D,
+            &8000, // 80% annual vol
+            &5000, // 50% correlation
         );
 
         assert!(quote.premium_amount > 0);
@@ -445,22 +448,12 @@ mod test {
     #[test]
     fn test_premium_scales_with_duration() {
         let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup(&env);
         let coverage_amount = 1_000_000i128;
 
-        let quote_7d = ILInsurance::calculate_premium(
-            env.clone(),
-            coverage_amount,
-            COVERAGE_7D,
-            8000,
-            5000,
-        );
-        let quote_90d = ILInsurance::calculate_premium(
-            env,
-            coverage_amount,
-            COVERAGE_90D,
-            8000,
-            5000,
-        );
+        let quote_7d = client.calculate_premium(&coverage_amount, &COVERAGE_7D, &8000, &5000);
+        let quote_90d = client.calculate_premium(&coverage_amount, &COVERAGE_90D, &8000, &5000);
 
         assert!(quote_90d.premium_amount >= quote_7d.premium_amount);
     }
@@ -468,22 +461,13 @@ mod test {
     #[test]
     fn test_premium_scales_with_volatility() {
         let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup(&env);
         let coverage_amount = 1_000_000i128;
 
-        let quote_low_vol = ILInsurance::calculate_premium(
-            env.clone(),
-            coverage_amount,
-            COVERAGE_30D,
-            2000,
-            5000,
-        );
-        let quote_high_vol = ILInsurance::calculate_premium(
-            env,
-            coverage_amount,
-            COVERAGE_30D,
-            10000,
-            5000,
-        );
+        let quote_low_vol = client.calculate_premium(&coverage_amount, &COVERAGE_30D, &2000, &5000);
+        let quote_high_vol =
+            client.calculate_premium(&coverage_amount, &COVERAGE_30D, &10000, &5000);
 
         assert!(quote_high_vol.premium_amount >= quote_low_vol.premium_amount);
     }
@@ -491,14 +475,11 @@ mod test {
     #[test]
     fn test_collateralization_ratio_empty() {
         let env = Env::default();
-        env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let reserve_token = Address::generate(&env);
-
-        ILInsurance::initialize(env.clone(), admin, reserve_token);
+        env.mock_all_auths_allowing_non_root_auth();
+        let client = setup(&env);
 
         // With no active coverage, should return very high ratio
-        let ratio = ILInsurance::get_collateralization_ratio(env);
+        let ratio = client.get_collateralization_ratio();
         assert!(ratio > 15000);
     }
 
@@ -506,11 +487,10 @@ mod test {
     fn test_il_sqrt_helper() {
         // sqrt_scaled(1000) = sqrt(1000) ≈ 31
         let result = ILInsurance::sqrt_scaled(1000);
-        assert!(result >= 31 && result <= 32);
+        assert!((31..=32).contains(&result));
 
         // sqrt_scaled(4000) = sqrt(4000) ≈ 63
         let result2 = ILInsurance::sqrt_scaled(4000);
-        assert!(result2 >= 63 && result2 <= 64);
+        assert!((63..=64).contains(&result2));
     }
 }
-
