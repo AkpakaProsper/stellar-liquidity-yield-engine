@@ -30,6 +30,8 @@ mod strategy_registry;
 mod il_insurance;
 #[cfg(feature = "actuary")]
 mod actuary;
+#[cfg(feature = "swap-router")]
+mod swap_router;
 
 #[cfg(feature = "yield-vault")]
 pub use yield_vault::*;
@@ -43,6 +45,8 @@ pub use strategy_registry::*;
 pub use il_insurance::*;
 #[cfg(feature = "actuary")]
 pub use actuary::*;
+#[cfg(feature = "swap-router")]
+pub use swap_router::*;
 
 #[cfg(feature = "engine")]
 #[contract]

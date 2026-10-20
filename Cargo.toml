@@ -36,6 +36,7 @@ default = [
     "strategy-registry",
     "il-insurance",
     "actuary",
+    "swap-router",
 ]
 
 # The umbrella `StellarLiquidityYieldEngine` contract in `src/lib.rs`.
@@ -48,6 +49,7 @@ reward-distributor = []
 strategy-registry = []
 il-insurance = []
 actuary = []
+swap-router = []
 
 [profile.release]
 opt-level = "z"
