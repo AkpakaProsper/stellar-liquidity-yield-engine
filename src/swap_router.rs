@@ -38,6 +38,62 @@ pub struct PoolInfo {
     pub is_stable_swap: bool,        // Stable swap pool (lower slippage)
 }
 
+impl PoolInfo {
+    /// Calculate depth score for pool selection
+    /// Higher score indicates better liquidity depth
+    /// Uses geometric mean of reserves to account for balanced liquidity
+    pub fn depth_score(&self) -> i128 {
+        // Use geometric mean: sqrt(reserve_a * reserve_b)
+        // This favors pools with balanced liquidity over skewed reserves
+        let product = self.reserve_a * self.reserve_b;
+        if product <= 0 {
+            return 0;
+        }
+        
+        // Integer square root approximation
+        self.isqrt(product)
+    }
+    
+    /// Integer square root using binary search
+    fn isqrt(n: i128) -> i128 {
+        if n <= 1 {
+            return n;
+        }
+        
+        let mut low = 1i128;
+        let mut high = n;
+        let mut result = 1i128;
+        
+        while low <= high {
+            let mid = (low + high) / 2;
+            let square = mid * mid;
+            
+            if square == n {
+                return mid;
+            } else if square < n {
+                result = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        
+        result
+    }
+    
+    /// Get total liquidity (sum of reserves)
+    pub fn total_liquidity(&self) -> i128 {
+        self.reserve_a + self.reserve_b
+    }
+    
+    /// Check if pool has sufficient liquidity for a given amount
+    /// Returns true if reserves are at least 10x the input amount
+    pub fn has_sufficient_liquidity(&self, input_amount: i128) -> bool {
+        let min_reserve = self.reserve_a.min(self.reserve_b);
+        min_reserve >= input_amount * 10
+    }
+}
+
 /// Swap quote result
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -630,21 +686,30 @@ impl SwapRouter {
         )
     }
 
-    /// Find direct pool path
+    /// Find direct pool path with depth-aware selection
+    /// Returns the pool with the highest depth score for the token pair
     fn find_direct_path(env: &Env, token_a: &Address, token_b: &Address) -> Option<PoolInfo> {
         let pools = Self::get_pools(env);
+        let mut best_pool: Option<PoolInfo> = None;
+        let mut best_depth_score: i128 = 0;
         
         for (_, pool) in pools.iter() {
             if (pool.token_a == *token_a && pool.token_b == *token_b) ||
                (pool.token_a == *token_b && pool.token_b == *token_a) {
-                return Some(pool);
+                
+                let depth_score = pool.depth_score();
+                if depth_score > best_depth_score {
+                    best_depth_score = depth_score;
+                    best_pool = Some(pool);
+                }
             }
         }
         
-        None
+        best_pool
     }
 
-    /// Find path through XLM
+    /// Find path through XLM with depth-aware selection
+    /// Selects pools with highest depth scores for both legs
     fn find_xlm_hop_path(
         env: &Env,
         input_token: &Address,
@@ -653,10 +718,10 @@ impl SwapRouter {
     ) -> Option<SwapPath> {
         let xlm = Self::get_xlm_token(env);
         
-        // Find input -> XLM pool
+        // Find input -> XLM pool (already depth-aware via find_direct_path)
         let input_pool = Self::find_direct_path(env, input_token, &xlm)?;
         
-        // Find XLM -> output pool
+        // Find XLM -> output pool (already depth-aware via find_direct_path)
         let output_pool = Self::find_direct_path(env, &xlm, output_token)?;
         
         // Calculate output through both pools
@@ -711,7 +776,7 @@ impl SwapRouter {
         None
     }
 
-    /// BFS helper for path finding
+    /// BFS helper for path finding with depth-aware pool selection
     fn bfs_find_path(
         env: &Env,
         current: &Address,
@@ -726,30 +791,52 @@ impl SwapRouter {
         
         let pools = Self::get_pools(env);
         
+        // Collect all pools that connect to current token with their depth scores
+        let mut pool_candidates: Vec<(PoolInfo, Address)> = Vec::new(env);
+        
         for (_, pool) in pools.iter() {
-            let next_token = if pool.token_a == *current {
+            if let Some(next_token) = if pool.token_a == *current {
                 Some(pool.token_b.clone())
             } else if pool.token_b == *current {
                 Some(pool.token_a.clone())
             } else {
                 None
-            }?;
-            
-            // Skip if already visited
-            let mut already_visited = false;
-            for v in visited.iter() {
-                if v == &next_token {
-                    already_visited = true;
-                    break;
+            } {
+                // Skip if already visited
+                let mut already_visited = false;
+                for v in visited.iter() {
+                    if v == &next_token {
+                        already_visited = true;
+                        break;
+                    }
+                }
+                if !already_visited {
+                    pool_candidates.push_back((pool, next_token));
                 }
             }
-            if already_visited {
-                continue;
+        }
+        
+        // Sort by depth score (highest first) using simple bubble sort
+        // In production, consider using a more efficient sorting algorithm
+        let n = pool_candidates.len();
+        for i in 0..n {
+            for j in 0..(n - i - 1) {
+                let (pool_a, _) = pool_candidates.get(j).unwrap();
+                let (pool_b, _) = pool_candidates.get(j + 1).unwrap();
+                if pool_a.depth_score() < pool_b.depth_score() {
+                    // Swap
+                    let temp = pool_candidates.get(j).unwrap().clone();
+                    pool_candidates.set(j, pool_candidates.get(j + 1).unwrap().clone());
+                    pool_candidates.set(j + 1, temp);
+                }
             }
-            
+        }
+        
+        // Try pools in order of depth score (highest first)
+        for (pool, next_token) in pool_candidates.iter() {
             // Calculate output for this leg
             let output = Self::calculate_direct_swap_output_for_pool(
-                &pool,
+                pool,
                 current,
                 amount,
             )?;
