@@ -1,4 +1,10 @@
-import { ArbitrageScanner, ArbitrageExecutor, ArbitrageOptimizer, Opportunity } from '../arbitrage';
+import {
+  ArbitrageScanner,
+  ArbitrageExecutor,
+  ArbitrageOptimizer,
+  Opportunity,
+  RoundTripCostEstimator,
+} from '../arbitrage';
 import { LedgerHeadSource, RpcLagMonitor, RpcLagOptions, RpcLagReport } from '../rpcSync';
 import { SorobanRpc } from 'stellar-sdk';
 import axios from 'axios';
@@ -14,6 +20,10 @@ export interface RebalancerConfig {
   discordWebhookUrl?: string;
   riskTolerance: number; // 1-10
   maxPositionSize: bigint;
+  /** Asset represented by maxPositionSize and the cost estimator's amounts. */
+  investmentAsset?: string;
+  /** Required to produce arbitrage recommendations; unknown fees fail closed. */
+  roundTripCostEstimator?: RoundTripCostEstimator;
   /**
    * RPC ledger-head source. When set, the keeper checks the node's head against
    * the last ledger it processed and warns before acting on stale data.
@@ -44,7 +54,9 @@ export class AutoRebalancer {
 
   constructor(config: RebalancerConfig) {
     this.config = config;
-    this.scanner = new ArbitrageScanner();
+    this.scanner = new ArbitrageScanner('https://horizon.stellar.org', {
+      roundTripCostEstimator: config.roundTripCostEstimator,
+    });
     this.executor = new ArbitrageExecutor();
     if (config.rpcHeadSource) {
       this.lagMonitor = new RpcLagMonitor(config.rpcHeadSource, config.lagOptions);
@@ -106,6 +118,11 @@ export class AutoRebalancer {
         this.config.currentVaultApy,
         this.config.minApyDelta,
         this.config.maxIlTolerance,
+        {
+          investmentAmount: this.config.maxPositionSize,
+          investmentAsset: this.config.investmentAsset ?? '',
+          sourcePoolId: this.config.currentPoolId,
+        },
       );
 
       if (opportunities.length === 0) {
@@ -120,9 +137,19 @@ export class AutoRebalancer {
 
       // Rank opportunities by risk-adjusted return
       const rankedOpps = ArbitrageOptimizer.rankOpportunities(
-        opportunities,
+        opportunities.filter((opportunity) => opportunity.recommended),
         this.config.riskTolerance,
       );
+
+      if (rankedOpps.length === 0) {
+        results.push({
+          timestamp: Date.now(),
+          success: false,
+          message: 'No opportunities remain eligible after net-profitability and risk checks',
+          lag,
+        });
+        return results;
+      }
 
       // Execute best opportunity if profitable
       const bestOpportunity = rankedOpps[0];
@@ -131,12 +158,14 @@ export class AutoRebalancer {
         this.config.maxPositionSize,
       );
 
-      if (profitability.netProfit <= BigInt(0)) {
+      if (!profitability.costEstimateAvailable || profitability.netProfit <= BigInt(0)) {
         results.push({
           timestamp: Date.now(),
           success: false,
           opportunity: bestOpportunity,
-          message: `Best opportunity not profitable. Net profit: ${profitability.netProfit}`,
+          message: profitability.costEstimateAvailable
+            ? `Best opportunity not profitable. Net profit: ${profitability.netProfit}`
+            : 'Best opportunity has no valid round-trip cost estimate for this position',
         });
         return results;
       }
@@ -147,12 +176,14 @@ export class AutoRebalancer {
         this.config.maxPositionSize,
       );
 
-      if (!simulation.profitable) {
+      if (!simulation.costEstimateAvailable || !simulation.profitable) {
         results.push({
           timestamp: Date.now(),
           success: false,
           opportunity: bestOpportunity,
-          message: `Simulation shows negative profit: ${simulation.netProfit}`,
+          message: simulation.costEstimateAvailable
+            ? `Simulation shows negative profit: ${simulation.netProfit}`
+            : 'Simulation has no valid round-trip cost estimate for this position',
         });
         return results;
       }
