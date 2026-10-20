@@ -1,4 +1,4 @@
-use soroban_sdk::{Address, Env, Symbol, Vec as SorobanVec, testutils::Address as _};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol, Vec as SorobanVec};
 use stellar_liquidity_yield_engine::{RebalanceEngine, RebalanceEngineClient};
 
 fn main() {}
@@ -18,6 +18,8 @@ mod tests {
         let token_a = Address::generate(env);
         let token_b = Address::generate(env);
         let mut allocations = SorobanVec::new(env);
+        
+        // Create two allocations that sum to 10000 (100%)
         allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
             pool_id: Address::generate(env),
             token_a: token_a.clone(),
@@ -26,6 +28,15 @@ mod tests {
             target_apy: 2000,
             current_apy: 1500,
             impermanent_loss_risk: 100,
+        });
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 5000,
+            target_apy: 1800,
+            current_apy: 1600,
+            impermanent_loss_risk: 80,
         });
 
         client.create_strategy(
@@ -48,10 +59,19 @@ mod tests {
 
         let proposals = client.analyze_rebalance_opportunities(&strategy_id);
 
-        assert!(proposals.len() > 0, "Expected proposals when current_apy < target_apy - threshold");
+        assert!(
+            proposals.len() > 0,
+            "Expected proposals when current_apy < target_apy - threshold"
+        );
         let proposal = proposals.get(0).unwrap();
-        assert!(proposal.expected_apy_improvement > 0, "Expected positive APY improvement");
-        assert!(proposal.estimated_gas_cost > 0, "Expected positive gas cost");
+        assert!(
+            proposal.expected_apy_improvement > 0,
+            "Expected positive APY improvement"
+        );
+        assert!(
+            proposal.estimated_gas_cost > 0,
+            "Expected positive gas cost"
+        );
     }
 
     #[test]
@@ -62,7 +82,7 @@ mod tests {
         let strategy_id = create_test_strategy(&env, &client, &admin);
 
         let proposals = client.analyze_rebalance_opportunities(&strategy_id);
-        
+
         // With current implementation, proposals are generated when current_apy < target_apy - min_apy_threshold
         // The mock returns 1500 APY, target is 2000, threshold is 200, so 1500 < 1800 = true, proposals generated
         // This test verifies the threshold logic
@@ -78,7 +98,7 @@ mod tests {
         let vault_pool_id = Address::generate(env);
         let vault_current_apy = 1000;
         let mut available_pools = SorobanVec::new(&env);
-        
+
         // Pool that meets minimum APY delta
         available_pools.push_back(stellar_liquidity_yield_engine::PoolAllocation {
             pool_id: Address::generate(&env),
@@ -90,9 +110,13 @@ mod tests {
             impermanent_loss_risk: 50,
         });
 
-        let opportunities = client.scan_opportunities(&vault_pool_id, vault_current_apy, available_pools);
-        
-        assert!(opportunities.len() > 0, "Expected opportunities meeting threshold");
+        let opportunities =
+            client.scan_opportunities(&vault_pool_id, vault_current_apy, available_pools);
+
+        assert!(
+            opportunities.len() > 0,
+            "Expected opportunities meeting threshold"
+        );
         let opp = opportunities.get(0).unwrap();
         assert!(opp.apy_delta >= 200, "Expected APY delta >= min threshold");
         assert!(opp.il_risk <= 100, "Expected IL risk within tolerance");
@@ -182,7 +206,10 @@ mod tests {
         }
 
         let history = client.get_history(&10000);
-        assert!(history.len() <= 1000, "History should be capped at 1000 entries");
+        assert!(
+            history.len() <= 1000,
+            "History should be capped at 1000 entries"
+        );
     }
 
     #[test]
@@ -205,5 +232,244 @@ mod tests {
                 "History should grow after rebalance"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "allocations must not be empty")]
+    fn test_create_strategy_rejects_empty_allocations() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        // Create an empty allocations vector
+        let allocations = SorobanVec::new(&env);
+
+        // This should panic with "allocations must not be empty"
+        client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "EmptyStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &allocations,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "allocations must sum to exactly 10000 bps")]
+    fn test_create_strategy_rejects_allocations_sum_not_10000() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let mut allocations = SorobanVec::new(&env);
+
+        // Create allocations that sum to 9000 (not 10000)
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 4000,
+            target_apy: 2000,
+            current_apy: 1500,
+            impermanent_loss_risk: 100,
+        });
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 5000,
+            target_apy: 2500,
+            current_apy: 1800,
+            impermanent_loss_risk: 150,
+        });
+
+        // This should panic with "allocations must sum to exactly 10000 bps (100%)"
+        client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "InvalidSumStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &allocations,
+        );
+    }
+
+    #[test]
+    fn test_create_strategy_accepts_valid_allocations_sum_10000() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let mut allocations = SorobanVec::new(&env);
+
+        // Create allocations that sum to exactly 10000
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 6000,
+            target_apy: 2000,
+            current_apy: 1500,
+            impermanent_loss_risk: 100,
+        });
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 4000,
+            target_apy: 2500,
+            current_apy: 1800,
+            impermanent_loss_risk: 150,
+        });
+
+        // This should succeed
+        let strategy_id = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "ValidStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &allocations,
+        );
+
+        assert!(strategy_id > 0, "Strategy should be created successfully");
+        
+        // Verify the strategy was stored correctly
+        let strategy = client.get_strategy(&strategy_id);
+        assert_eq!(strategy.strategy_id, strategy_id);
+        assert_eq!(strategy.allocations.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "allocations must not be empty")]
+    fn test_update_strategy_rejects_empty_allocations() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        // First create a valid strategy
+        let strategy_id = create_test_strategy(&env, &client, &admin);
+
+        // Try to update with empty allocations
+        let empty_allocations = SorobanVec::new(&env);
+
+        // This should panic with "allocations must not be empty"
+        client.update_strategy(
+            &admin,
+            &strategy_id,
+            &Symbol::new(&env, "UpdatedStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &empty_allocations,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "allocations must sum to exactly 10000 bps")]
+    fn test_update_strategy_rejects_allocations_sum_not_10000() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        // First create a valid strategy
+        let strategy_id = create_test_strategy(&env, &client, &admin);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let mut allocations = SorobanVec::new(&env);
+
+        // Create allocations that sum to 11000 (not 10000)
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 6000,
+            target_apy: 2000,
+            current_apy: 1500,
+            impermanent_loss_risk: 100,
+        });
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 5000,
+            target_apy: 2500,
+            current_apy: 1800,
+            impermanent_loss_risk: 150,
+        });
+
+        // This should panic with "allocations must sum to exactly 10000 bps (100%)"
+        client.update_strategy(
+            &admin,
+            &strategy_id,
+            &Symbol::new(&env, "InvalidUpdateStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &allocations,
+        );
+    }
+
+    #[test]
+    fn test_update_strategy_accepts_valid_allocations_sum_10000() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (client, admin) = setup_rebalance_engine(&env);
+
+        // First create a valid strategy
+        let strategy_id = create_test_strategy(&env, &client, &admin);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let mut allocations = SorobanVec::new(&env);
+
+        // Create allocations that sum to exactly 10000
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 3000,
+            target_apy: 2000,
+            current_apy: 1500,
+            impermanent_loss_risk: 100,
+        });
+        allocations.push_back(stellar_liquidity_yield_engine::PoolAllocation {
+            pool_id: Address::generate(&env),
+            token_a: token_a.clone(),
+            token_b: token_b.clone(),
+            allocation_percent: 7000,
+            target_apy: 2500,
+            current_apy: 1800,
+            impermanent_loss_risk: 150,
+        });
+
+        // This should succeed
+        client.update_strategy(
+            &admin,
+            &strategy_id,
+            &Symbol::new(&env, "ValidUpdateStrategy"),
+            &2u32,
+            &200u32,
+            &100u32,
+            &86400u64,
+            &allocations,
+        );
+
+        // Verify the strategy was updated correctly
+        let strategy = client.get_strategy(&strategy_id);
+        assert_eq!(strategy.allocations.len(), 2);
+        assert_eq!(strategy.allocations.get(0).unwrap().allocation_percent, 3000);
+        assert_eq!(strategy.allocations.get(1).unwrap().allocation_percent, 7000);
     }
 }
