@@ -53,6 +53,8 @@ pub struct WithdrawWindow {
     pub shares_withdrawn: i128,
     /// Shares the measured party held when the window opened.
     pub window_start_shares: i128,
+}
+
 /// An economic-parameter change waiting out its time lock.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -963,6 +965,8 @@ impl YieldVault {
         env.storage()
             .instance()
             .set(&Symbol::new(env, "vault_withdraw_window"), &vault_window);
+    }
+
     /// The queued timelocked actions, keyed by action id.
     fn get_pending_actions(env: Env) -> Map<u64, PendingAction> {
         env.storage()
