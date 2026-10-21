@@ -6,8 +6,15 @@ use soroban_sdk::{
 /// Maximum path length for multi-hop swaps
 const MAX_PATH_LENGTH: u32 = 3;
 
-/// Maximum slippage in basis points (default 1%)
-const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
+/// Maximum permitted slippage tolerance in basis points (1% = 100 bps).
+///
+/// The router's existing default and the reward distributor's fixed tolerance
+/// are both 100 bps. Keeping the configurable value at or below that limit
+/// ensures a quote always retains at least 99% of its expected output.
+const MAX_SLIPPAGE_BPS: u32 = 100;
+
+/// Default slippage tolerance in basis points (1%).
+const DEFAULT_MAX_SLIPPAGE_BPS: u32 = MAX_SLIPPAGE_BPS;
 
 /// Treasury fee in basis points (0.25%)
 const PROTOCOL_TREASURY_FEE_BPS: u32 = 25;
@@ -280,8 +287,8 @@ impl SwapRouter {
     ) -> SwapQuote {
         require!(input_amount > 0, SwapError::InvalidPath);
         
-        let slippage = max_slippage_bps.unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS);
-        require!(slippage <= BPS_DIVISOR as u32, SwapError::InvalidSlippage);
+        let slippage = max_slippage_bps.unwrap_or_else(|| Self::get_default_slippage(env.clone()));
+        Self::require_valid_slippage(slippage);
         
         // Find best path
         let (path, route_type) = Self::find_best_path(&env, &input_token, &output_token, input_amount);
@@ -329,7 +336,10 @@ impl SwapRouter {
                     input_amount,
                 );
                 
-                let minimum_output = Self::calculate_minimum_output(expected_output, DEFAULT_MAX_SLIPPAGE_BPS);
+                let minimum_output = Self::calculate_minimum_output(
+                    expected_output,
+                    Self::get_default_slippage(env.clone()),
+                );
                 let protocol_fee = (expected_output * PROTOCOL_TREASURY_FEE_BPS as i128) / BPS_DIVISOR;
                 
                 let path = SwapPath {
@@ -536,8 +546,20 @@ impl SwapRouter {
     /// Update default slippage (admin only)
     pub fn update_default_slippage(env: Env, admin: Address, new_slippage_bps: u32) {
         Self::require_admin(&env, admin);
-        require!(new_slippage_bps <= BPS_DIVISOR as u32, SwapError::InvalidSlippage);
+        Self::require_valid_slippage(new_slippage_bps);
         env.storage().instance().set(&Symbol::new(&env, "default_slippage"), &new_slippage_bps);
+    }
+
+    /// Return the configured default slippage tolerance in basis points.
+    pub fn get_default_slippage(env: Env) -> u32 {
+        let slippage = env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "default_slippage"))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS);
+        // Do not let a legacy or corrupted persisted value silently weaken
+        // protection when it is consumed by a quote.
+        Self::require_valid_slippage(slippage);
+        slippage
     }
 
     /// Update treasury address (admin only)
@@ -636,9 +658,8 @@ impl SwapRouter {
         require!(caller == admin, SwapError::Unauthorized);
     }
 
-    fn require_admin_ref(env: &Env, caller: &Address) {
-        let admin = Self::get_admin(env.clone());
-        require!(caller == &admin, SwapError::Unauthorized);
+    fn require_valid_slippage(slippage_bps: u32) {
+        require!(slippage_bps <= MAX_SLIPPAGE_BPS, SwapError::InvalidSlippage);
     }
 
     fn require_not_paused(env: &Env) {

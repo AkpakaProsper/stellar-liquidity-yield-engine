@@ -350,6 +350,14 @@ import { ImpermanentLossChart } from '@/components/ImpermanentLossChart';
 - **Multi-signature**: Enhanced admin security
 - **Audit Trail**: Complete operation logging
 
+#### Swap-router slippage tolerance
+
+`max_slippage_bps` and the router's `default_slippage` are integer basis
+points (`100` = 1%). They accept values from `0` through `100` inclusive.
+Values above `100` are rejected with `InvalidSlippage`; an invalid admin update
+does not replace the previously configured value. Supplying no per-quote value
+uses the validated configured default.
+
 ## 📊 Performance Metrics
 
 ### Key Performance Indicators
