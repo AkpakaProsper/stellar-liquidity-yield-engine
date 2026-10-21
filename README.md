@@ -159,6 +159,36 @@ The rebalancing engine automatically optimizes liquidity allocation:
 - **Gas Optimization**: Batch transactions for cost efficiency
 - **Slippage Protection**: Maximum slippage tolerance settings
 
+### Arbitrage profitability and round-trip costs
+
+The SDK compares one year of expected APY-difference returns against a
+round-trip estimate for the configured investment amount. The estimate must
+cover both entering the destination pool and exiting it, and must report
+network, execution, and protocol costs in the same asset and base units as the
+investment. The scanner exposes `gross_profit` before these fees,
+`round_trip_cost` for their sum, and `net_profit` after fees. Opportunities with
+zero or negative net profit are excluded; remaining opportunities are ranked by
+net return with the existing impermanent-loss risk adjustment. IL risk remains
+a separate routing check and is deducted by the profitability simulation.
+
+Provide an `ArbitrageScanner` `roundTripCostEstimator` (and pass the investment
+amount, asset, and source pool to `findOpportunities`) to enable cost-aware
+recommendations. `AutoRebalancer` accepts the same estimator and an
+`investmentAsset` for its `maxPositionSize`. The estimator must convert fees
+such as XLM-denominated network charges into the investment asset using a
+trustworthy quote source, return all three cost components, and return `null`
+if a component or conversion is unavailable. Missing, negative, malformed, or
+wrong-asset estimates are logged and excluded; the SDK never treats unknown
+fees as zero. The same round-trip estimate is reused by ranking, profitability
+calculation, and simulation rather than charged again at each step.
+
+There is currently no built-in network-fee, execution-fee, or protocol-fee
+oracle/converter for this arbitrage path. Until an estimator is configured,
+arbitrage opportunities are intentionally not recommended. APY differences are
+annualized, so the comparison assumes a one-year holding period; shorter
+holding periods and unmodeled costs must be handled by the configured estimator
+or a separate strategy constraint.
+
 ### Configuration
 ```typescript
 const rebalancerClient = new RebalancerClient(TESTNET_CONFIG);

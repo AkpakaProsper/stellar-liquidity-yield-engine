@@ -1,19 +1,20 @@
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token::TokenClient,
-    unwrap::UnwrapOptimized, Address, Env, IntoVal, Map, Symbol, Vec,
+    Address, Env, IntoVal, Map, Symbol, Vec,
 };
 
 /// Maximum number of concurrent reward streams supported
 const MAX_REWARD_STREAMS: u32 = 10;
 
 /// Basis points divisor (10000 = 100%)
-const BASIS_POINTS_DIVISOR: i128 = 10000;
+const BPS_DIVISOR: i128 = 10000;
 
 /// Treasury fee in basis points (0.25% = 25 bps)
 const TREASURY_FEE_BPS: u32 = 25;
 
-/// Maximum slippage in basis points (1% = 100 bps)
-const MAX_SLIPPAGE_BPS: u32 = 100;
+/// Default maximum slippage in basis points (1% = 100 bps)
+/// Aligned with swap_router::DEFAULT_MAX_SLIPPAGE_BPS for consistency
+const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 100;
 
 /// Reward stream configuration
 #[contracttype]
@@ -190,6 +191,11 @@ impl MultiRewardDistributor {
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &false);
 
+        // Initialize default slippage (aligned with swap_router for consistency)
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "default_slippage"), &DEFAULT_MAX_SLIPPAGE_BPS);
+
         // Initialize empty reward streams
         let streams: Vec<RewardStream> = Vec::new(&env);
         env.storage()
@@ -281,12 +287,7 @@ impl MultiRewardDistributor {
     /// indefinitely again. Extending a deadline is the way to reopen a stream
     /// that already expired, since claims are rejected on comparison with the
     /// current ledger time rather than on a stored "expired" flag.
-    pub fn set_claim_deadline(
-        env: Env,
-        admin: Address,
-        stream_index: u32,
-        claim_deadline: u64,
-    ) {
+    pub fn set_claim_deadline(env: Env, admin: Address, stream_index: u32, claim_deadline: u64) {
         Self::require_admin(&env, admin.clone());
 
         let mut streams = Self::get_streams(&env);
@@ -500,11 +501,12 @@ impl MultiRewardDistributor {
             if let Some(target_token) = &convert_to {
                 if *target_token != stream.token {
                     // Queue swap via swap router
+                    let default_slippage = Self::get_default_slippage(env.clone());
                     let min_received = Self::calculate_min_received(
                         net_reward,
                         &stream.token,
                         target_token,
-                        MAX_SLIPPAGE_BPS,
+                        default_slippage,
                     );
 
                     let swap_success = Self::execute_swap(
@@ -842,8 +844,6 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &true);
-
-        env.events().publish(("emergency_mode_enabled",), ());
     }
 
     /// Disable emergency mode (admin only)
@@ -852,8 +852,27 @@ impl MultiRewardDistributor {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "emergency_mode"), &false);
+    }
 
-        env.events().publish(("emergency_mode_disabled",), ());
+    /// Update default slippage (admin only)
+    /// Aligned with swap_router::update_default_slippage for consistency
+    pub fn update_default_slippage(env: Env, admin: Address, new_slippage_bps: u32) {
+        Self::require_admin(&env, admin);
+        require!(new_slippage_bps <= BPS_DIVISOR as u32, RewardError::InvalidPercentage);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "default_slippage"), &new_slippage_bps);
+
+        env.events()
+            .publish(("default_slippage_updated",), (admin, new_slippage_bps));
+    }
+
+    /// Get the current default slippage setting
+    pub fn get_default_slippage(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "default_slippage"))
+            .unwrap_or(DEFAULT_MAX_SLIPPAGE_BPS)
     }
 
     /// Fund reward pool (deposit tokens for distribution)
@@ -1086,8 +1105,8 @@ impl MultiRewardDistributor {
     ) -> i128 {
         // In production, query DEX for expected output
         // Apply slippage protection
-        let slippage_factor = (BASIS_POINTS_DIVISOR - max_slippage_bps as i128) as i128;
-        amount * slippage_factor / BASIS_POINTS_DIVISOR
+        let slippage_factor = (BPS_DIVISOR - max_slippage_bps as i128) as i128;
+        amount * slippage_factor / BPS_DIVISOR
     }
 
     fn execute_swap(
@@ -1176,10 +1195,10 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger as _};
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{
         token::{StellarAssetClient, TokenClient},
-        Env, IntoVal, Symbol,
+        Env,
     };
 
     fn setup(
@@ -1188,8 +1207,8 @@ mod tests {
         Address,
         Address,
         Address,
-        MultiRewardDistributorClient,
-        TokenClient,
+        MultiRewardDistributorClient<'_>,
+        TokenClient<'_>,
     ) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -1197,7 +1216,7 @@ mod tests {
         let token = env.register_stellar_asset_contract_v2(admin.clone());
         let token_client = TokenClient::new(env, &token.address());
 
-        let contract_id = env.register_contract(None, MultiRewardDistributor);
+        let contract_id = env.register(MultiRewardDistributor, ());
         let client = MultiRewardDistributorClient::new(env, &contract_id);
 
         client.initialize(&admin, &treasury, &swap_router);
@@ -1213,13 +1232,20 @@ mod tests {
 
         let user_a = Address::generate(&env);
         let user_b = Address::generate(&env);
-        let token = Address::generate(&env);
+        // The stream's reward token must be a real token contract: funding it
+        // transfers tokens, which a bare generated address cannot do.
+        let token = token_client.address.clone();
+        let vault = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&admin, &1_000_000);
 
         client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &1_000_000);
 
-        let rewards_a = client.update_rewards(&user_a, &token, &1000, &7);
-        let rewards_b = client.update_rewards(&user_b, &token, &2000, &7);
+        // Accrual is rate * elapsed: without advancing the clock, both users
+        // would correctly accrue zero.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 3_600);
+        let rewards_a = client.update_rewards(&user_a, &vault, &1000, &7);
+        let rewards_b = client.update_rewards(&user_b, &vault, &2000, &7);
 
         let pending_a = rewards_a.get(0).unwrap();
         let pending_b = rewards_b.get(0).unwrap();
@@ -1236,16 +1262,22 @@ mod tests {
         let (admin, _treasury, _swap_router, client, token_client) = setup(&env);
 
         let user = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = token_client.address.clone();
+        let vault = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&admin, &10_000_000);
 
         client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &10_000_000);
 
-        client.update_rewards(&user, &token, &1000, &7);
+        // Accrue at the original rate, then advance again after the rate change
+        // so the third update sees the new rate's contribution.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1_000);
+        client.update_rewards(&user, &vault, &1000, &7);
         client.update_reward_rate(&admin, &0, &2000);
-        client.update_rewards(&user, &token, &1000, &7);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1_000);
+        client.update_rewards(&user, &vault, &1000, &7);
 
-        let rewards = client.update_rewards(&user, &token, &1000, &7);
+        let rewards = client.update_rewards(&user, &vault, &1000, &7);
         let pending = rewards.get(0).unwrap();
         assert!(pending > 0);
     }
@@ -1273,15 +1305,17 @@ mod tests {
         let (admin, _treasury, _swap_router, client, token_client) = setup(&env);
 
         let user = Address::generate(&env);
-        let token = Address::generate(&env);
+        let token = token_client.address.clone();
+        let vault = Address::generate(&env);
+        StellarAssetClient::new(&env, &token).mint(&admin, &1_000_000);
 
         client.add_reward_stream(&admin, &token, &1000, &7, &0);
         client.fund_reward_pool(&admin, &token, &1_000_000);
 
         client.set_auto_compound_config(&user, &token, &5000, &true);
-        client.update_rewards(&user, &token, &1000, &7);
+        client.update_rewards(&user, &vault, &1000, &7);
 
-        let reinvest = client.execute_auto_compound(&user, &token, &Vec::from_array(&env, [0u32]));
+        let reinvest = client.execute_auto_compound(&user, &vault, &Vec::from_array(&env, [0u32]));
         let total = reinvest.get(token.clone()).unwrap_or(0);
         assert!(total >= 0);
     }
@@ -1299,9 +1333,9 @@ mod tests {
     ) -> (
         Address,
         Address,
-        MultiRewardDistributorClient,
-        StellarAssetClient,
-        TokenClient,
+        MultiRewardDistributorClient<'_>,
+        StellarAssetClient<'_>,
+        TokenClient<'_>,
     ) {
         let admin = Address::generate(env);
         let treasury = Address::generate(env);
@@ -1311,7 +1345,7 @@ mod tests {
         let token_admin = StellarAssetClient::new(env, &reward_token.address());
         let token_client = TokenClient::new(env, &reward_token.address());
 
-        let contract_id = env.register_contract(None, MultiRewardDistributor);
+        let contract_id = env.register(MultiRewardDistributor, ());
         let client = MultiRewardDistributorClient::new(env, &contract_id);
         client.initialize(&admin, &treasury, &swap_router);
         client.add_reward_stream(
@@ -1415,8 +1449,7 @@ mod tests {
         env.mock_all_auths_allowing_non_root_auth();
         env.ledger().set_timestamp(1_000);
 
-        let (_admin, _treasury, client, _token_admin, token_client) =
-            setup_stream(&env, 1_000, 0);
+        let (_admin, _treasury, client, _token_admin, token_client) = setup_stream(&env, 1_000, 0);
         assert_eq!(client.get_stream(&0).claim_deadline, 0);
 
         let user = Address::generate(&env);
@@ -1481,8 +1514,7 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
 
-        let (admin, _treasury, client, _token_admin, _token_client) =
-            setup_stream(&env, 1_000, 0);
+        let (admin, _treasury, client, _token_admin, _token_client) = setup_stream(&env, 1_000, 0);
 
         let err = client
             .try_set_claim_deadline(&admin, &7, &10_000)
