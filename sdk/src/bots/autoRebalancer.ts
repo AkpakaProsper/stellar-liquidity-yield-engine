@@ -43,6 +43,13 @@ export interface RebalanceResult {
   lag?: RpcLagReport;
 }
 
+export interface AutoRebalancerOptions {
+  /** Override the opportunity scanner (defaults to a real Horizon-backed one). */
+  scanner?: ArbitrageScanner;
+  /** Override the executor, e.g. to configure its write pacing. */
+  executor?: ArbitrageExecutor;
+}
+
 export class AutoRebalancer {
   private config: RebalancerConfig;
   private scanner: ArbitrageScanner;
@@ -52,7 +59,7 @@ export class AutoRebalancer {
   private lagMonitor?: RpcLagMonitor;
   private lastLag?: RpcLagReport;
 
-  constructor(config: RebalancerConfig) {
+  constructor(config: RebalancerConfig, options: AutoRebalancerOptions = {}) {
     this.config = config;
     this.scanner = new ArbitrageScanner('https://horizon.stellar.org', {
       roundTripCostEstimator: config.roundTripCostEstimator,
@@ -61,6 +68,11 @@ export class AutoRebalancer {
     if (config.rpcHeadSource) {
       this.lagMonitor = new RpcLagMonitor(config.rpcHeadSource, config.lagOptions);
     }
+  }
+
+  /** Write-pacing counters for the executor this keeper writes through. */
+  getWriteLimiterStats() {
+    return this.executor.getWriteLimiterStats();
   }
 
   /**
