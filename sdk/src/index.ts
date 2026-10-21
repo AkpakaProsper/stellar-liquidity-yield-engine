@@ -18,7 +18,15 @@ export {
   HorizonVolatilitySource,
   realizedVolatilityBp,
 } from './arbitrage';
-export type { VolatilitySource, VolatilityMetrics, PoolMetrics, Opportunity } from './arbitrage';
+export type {
+  VolatilitySource,
+  VolatilityMetrics,
+  PoolMetrics,
+  Opportunity,
+  RoundTripCostEstimate,
+  RoundTripCostEstimator,
+  OpportunityScanOptions,
+} from './arbitrage';
 
 // Issue #130: Strategy registry client for fetching active strategies.
 // A dedicated on-chain registry contract is not yet deployed, so this client
