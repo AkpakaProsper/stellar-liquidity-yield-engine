@@ -1670,6 +1670,9 @@ mod tests {
             expected_apy_improvement: 0,
             estimated_gas_cost: 0,
             timestamp: 0,
+        }
+    }
+
     // ============ CIRCUIT BREAKER TESTS (Issue #303) ============
 
     /// The breaker rule is a pure function: no engine, no storage, no ledger.
@@ -1777,6 +1780,9 @@ mod tests {
             client.set_rebalance_pacing(&admin, &100, &0);
         }));
         assert!(no_window.is_err());
+    }
+
+    #[test]
     fn test_breaker_does_not_trip_before_it_has_enough_history() {
         let env = Env::default();
         env.mock_all_auths_allowing_non_root_auth();
