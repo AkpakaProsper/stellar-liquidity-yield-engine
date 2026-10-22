@@ -511,6 +511,9 @@ before running step 4 above).
 
 ## 🧪 Testing
 
+For reproducible randomized swap path and quote tests, including seed replay
+and known router limitations, see [Router fuzzing](docs/ROUTER_FUZZING.md).
+
 ### Unit Tests
 ```bash
 # Run contract tests (run from the repository root)
