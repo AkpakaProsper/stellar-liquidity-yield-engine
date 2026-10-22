@@ -96,6 +96,10 @@ pub struct ArbitrageThresholds {
     pub min_apy_delta: u32, // Minimum APY difference to trigger rebalance (basis points)
     pub max_il_tolerance: u32, // Maximum acceptable IL (basis points)
     pub cooldown_period: u64, // Seconds between rebalances, applied per vault
+    /// Minimum estimated net profit for an opportunity to be routed, in the
+    /// same units as [`ArbitrageOpportunity::net_profit`] (Issue #294).
+    /// `0` disables the filter.
+    pub min_net_profit: i128,
 }
 
 /// Validation-failure tracking for one pool's oracle feed (Issue #289).
@@ -1150,10 +1154,15 @@ impl RebalanceEngine {
     ) {
         Self::require_admin(&env, admin.clone());
 
+        // Preserve any configured minimum opportunity size (Issue #294); it has
+        // its own setter so this entrypoint's argument list stays unchanged.
+        let min_net_profit = Self::get_arbitrage_thresholds(env.clone()).min_net_profit;
+
         let thresholds = ArbitrageThresholds {
             min_apy_delta,
             max_il_tolerance,
             cooldown_period,
+            min_net_profit,
         };
 
         env.storage()
@@ -1175,7 +1184,34 @@ impl RebalanceEngine {
                 min_apy_delta: 200u32,     // Default 2%
                 max_il_tolerance: 100u32,  // Default 1%
                 cooldown_period: 86400u64, // Default 24 hours
+                min_net_profit: 0i128,     // No minimum opportunity size
             })
+    }
+
+    /// Set the minimum estimated net profit an arbitrage opportunity must reach
+    /// before routing will consider it (admin only, Issue #294).
+    ///
+    /// `min_net_profit` is in the same units as
+    /// [`ArbitrageOpportunity::net_profit`]; `0` disables the filter.
+    pub fn set_min_net_profit(env: Env, admin: Address, min_net_profit: i128) {
+        Self::require_admin(&env, admin.clone());
+        require!(min_net_profit >= 0, "min_net_profit must not be negative");
+
+        let mut thresholds = Self::get_arbitrage_thresholds(env.clone());
+        thresholds.min_net_profit = min_net_profit;
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "arbitrage_thresholds"), &thresholds);
+
+        env.events().publish(
+            (Symbol::new(&env, "min_net_profit_updated"),),
+            (admin, min_net_profit),
+        );
+    }
+
+    /// Minimum estimated net profit required to route an opportunity.
+    pub fn get_min_net_profit(env: Env) -> i128 {
+        Self::get_arbitrage_thresholds(env).min_net_profit
     }
 
     /// Scan available pools and identify arbitrage opportunities
@@ -1214,6 +1250,13 @@ impl RebalanceEngine {
                 // Estimated net profit = APY improvement - IL risk - slippage (simplified)
                 let net_profit_estimate =
                     ((apy_delta as i128 - pool.impermanent_loss_risk as i128) * 1000000) / 10000;
+
+                // Issue #294: drop opportunities too small to be worth
+                // executing. `min_net_profit == 0` disables the filter, so the
+                // default configuration keeps the previous behaviour.
+                if net_profit_estimate < thresholds.min_net_profit {
+                    continue;
+                }
 
                 let opportunity = ArbitrageOpportunity {
                     pool_id: pool.pool_id,
@@ -1565,6 +1608,20 @@ mod tests {
             target_apy: target,
             current_apy: current,
             impermanent_loss_risk: 50,
+        }
+    }
+
+    /// Like [`allocation`], but with an explicit impermanent-loss risk so the
+    /// net-profit filter (Issue #294) can be exercised.
+    fn allocation_with_il(env: &Env, pool: &Address, il_risk: u32) -> PoolAllocation {
+        PoolAllocation {
+            pool_id: pool.clone(),
+            token_a: Address::generate(env),
+            token_b: Address::generate(env),
+            allocation_percent: 5000,
+            target_apy: 1000,
+            current_apy: 1000,
+            impermanent_loss_risk: il_risk,
         }
     }
 
@@ -2371,5 +2428,145 @@ mod tests {
             Symbol::new(&env, "pool_apy_updated"),
             "there is no previous observation to be unchanged from"
         );
+    }
+
+    // ============ MINIMUM OPPORTUNITY SIZING TESTS (Issue #294) ============
+
+    /// A pool whose estimated net profit is below the configured minimum is
+    /// dropped from the scan; a larger opportunity in the same scan survives.
+    #[test]
+    fn test_scan_opportunities_filters_below_min_net_profit() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let small_pool = Address::generate(&env);
+        let large_pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+
+        // (apy_delta - il_risk) * 100 = net profit:
+        //   small: (1500 - 900) * 100 = 60_000
+        //   large: (1500 - 100) * 100 = 140_000
+        client.update_pool_apy(&admin, &small_pool, &2500);
+        client.update_pool_apy(&admin, &large_pool, &2500);
+
+        let pools = Vec::from_array(
+            &env,
+            [
+                allocation_with_il(&env, &small_pool, 900),
+                allocation_with_il(&env, &large_pool, 100),
+            ],
+        );
+
+        // Without a minimum both opportunities are returned.
+        assert_eq!(client.get_min_net_profit(), 0);
+        let all = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(all.len(), 2);
+
+        // A minimum between the two drops the trivial one.
+        client.set_min_net_profit(&admin, &100_000);
+        assert_eq!(client.get_min_net_profit(), 100_000);
+
+        let filtered = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get(0).unwrap().pool_id, large_pool);
+        assert_eq!(filtered.get(0).unwrap().net_profit, 140_000);
+
+        // Raising the minimum above every opportunity filters them all out.
+        client.set_min_net_profit(&admin, &500_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+    }
+
+    /// An opportunity exactly at the minimum is kept; the filter is a strict
+    /// lower bound.
+    #[test]
+    fn test_min_net_profit_boundary_is_inclusive() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+        client.update_pool_apy(&admin, &pool, &2500);
+
+        // (1500 - 500) * 100 = 100_000
+        let pools = Vec::from_array(&env, [allocation_with_il(&env, &pool, 500)]);
+
+        client.set_min_net_profit(&admin, &100_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            1
+        );
+
+        client.set_min_net_profit(&admin, &100_001);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+    }
+
+    /// The minimum is disabled by default and a zero value re-disables it.
+    #[test]
+    fn test_min_net_profit_default_and_disable() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &1000, &86400);
+        client.update_pool_apy(&admin, &pool, &2500);
+
+        let pools = Vec::from_array(&env, [allocation_with_il(&env, &pool, 900)]);
+
+        client.set_min_net_profit(&admin, &1_000_000);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            0
+        );
+
+        client.set_min_net_profit(&admin, &0);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            1
+        );
+    }
+
+    /// Updating the other thresholds does not clear the configured minimum.
+    #[test]
+    fn test_set_rebalance_thresholds_preserves_min_net_profit() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+
+        client.set_min_net_profit(&admin, &75_000);
+        client.set_rebalance_thresholds(&admin, &300, &200, &3600);
+
+        let thresholds = client.get_arbitrage_thresholds();
+        assert_eq!(thresholds.min_apy_delta, 300);
+        assert_eq!(thresholds.max_il_tolerance, 200);
+        assert_eq!(thresholds.cooldown_period, 3600);
+        assert_eq!(thresholds.min_net_profit, 75_000);
+    }
+
+    /// Setting the minimum is admin-only and rejects negative values.
+    #[test]
+    fn test_set_min_net_profit_is_admin_only_and_non_negative() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let unauthorized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_min_net_profit(&stranger, &1_000);
+        }));
+        assert!(unauthorized.is_err(), "minimum must be admin only");
+
+        let negative = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_min_net_profit(&admin, &-1);
+        }));
+        assert!(negative.is_err(), "a negative minimum is meaningless");
+
+        assert_eq!(client.get_min_net_profit(), 0);
     }
 }
