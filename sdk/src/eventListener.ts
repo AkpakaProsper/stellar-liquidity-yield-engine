@@ -1,3 +1,4 @@
+
 /**
  * Address-filtered contract event listener.
  *
@@ -243,6 +244,46 @@ export class ContractEventListener {
   /** Timer handle returned by `setInterval`, null when stopped. */
   private intervalHandle: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * Structured logger used for skipped/aborted action diagnostics.
+   *
+   * Emits a single-line JSON record so operators can grep/parse logs. A
+   * skipped action is any event that was fetched but never dispatched to a
+   * handler (address-filtered, unknown topic, or no registered handler).
+   *
+   * Example log interpretation guide:
+   *
+   *   {"component":"ContractEventListener","event":"action_skipped",
+   *    "reason":"address_filtered","contractId":"C...","ledger":123,
+   *    "cursor":120,"eventName":null}
+   *     -> Event came from a contract not in `contractAddresses`; expected
+   *        noise from a shared RPC. Safe to ignore.
+   *
+   *   {"component":"ContractEventListener","event":"action_skipped",
+   *    "reason":"unknown_topic","contractId":"C...","ledger":124,
+   *    "cursor":120,"eventName":null}
+   *     -> Event passed the address filter but its first topic was not a
+   *        known SDK event name. Attach an `onRaw` handler to inspect it.
+   *
+   *   {"component":"ContractEventListener","event":"action_skipped",
+   *    "reason":"no_handler","contractId":"C...","ledger":125,
+   *    "cursor":120,"eventName":"deposit"}
+   *     -> A typed event was recognised but no handler was registered for
+   *        it. Register `listener.on('deposit', ...)` to consume it.
+   */
+  private logSkipped(reason: string, raw: RawContractEvent, eventName: KnownEventName | null): void {
+    // eslint-disable-next-line no-console
+    console.debug(JSON.stringify({
+      component: 'ContractEventListener',
+      event: 'action_skipped',
+      reason,
+      contractId: raw.contractId,
+      ledger: raw.ledger,
+      cursor: this.cursor,
+      eventName,
+    }));
+  }
+
   constructor(source: EventSource, config: ListenerConfig) {
     this.source = source;
     this.config = config;
@@ -393,7 +434,10 @@ export class ContractEventListener {
 
     for (const raw of events) {
       // SDK-level guard: drop events not in the allow-list.
-      if (!this.isAllowed(raw.contractId)) continue;
+      if (!this.isAllowed(raw.contractId)) {
+        this.logSkipped('address_filtered', raw, null);
+        continue;
+      }
 
       const unknown: UnknownContractEvent = {
         contractId: raw.contractId,
@@ -409,7 +453,10 @@ export class ContractEventListener {
       // Attempt typed dispatch.
       const name = this.extractEventName(raw);
       if (name !== null) {
-        this.dispatchTyped(name, raw);
+        const dispatched = this.dispatchTyped(name, raw);
+        if (!dispatched) this.logSkipped('no_handler', raw, name);
+      } else {
+        this.logSkipped('unknown_topic', raw, null);
       }
     }
 
@@ -458,10 +505,13 @@ export class ContractEventListener {
   /**
    * Build a typed SDK event from the raw RPC event and call all registered
    * handlers for the given name.
+   *
+   * Returns `true` when at least one handler was invoked, `false` when the
+   * event was recognised but no handler was registered (caller logs the skip).
    */
-  private dispatchTyped(name: KnownEventName, raw: RawContractEvent): void {
+  private dispatchTyped(name: KnownEventName, raw: RawContractEvent): boolean {
     const set = this.handlers.get(name);
-    if (!set || set.size === 0) return;
+    if (!set || set.size === 0) return false;
 
     const base = {
       contractId: raw.contractId,
@@ -507,5 +557,6 @@ export class ContractEventListener {
     }
 
     set.forEach((h) => (h as (e: typeof evt) => void)(evt));
+    return true;
   }
 }
