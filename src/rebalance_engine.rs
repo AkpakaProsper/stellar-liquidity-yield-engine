@@ -21,6 +21,10 @@ pub const MAX_APY_BPS: u32 = 1_000_000;
 /// Default age after which an APY observation is considered stale: 24 hours.
 pub const DEFAULT_MAX_APY_AGE: u64 = 86_400;
 
+/// Default number of rejected observations that excludes a pool from routing
+/// until its feed is accepted again (Issue #289).
+pub const DEFAULT_FEED_FAILURE_THRESHOLD: u32 = 3;
+
 /// Number of consecutive failed rebalances that trips the circuit breaker.
 pub const EMERGENCY_STOP_WINDOW: u32 = 3;
 
@@ -92,6 +96,24 @@ pub struct ArbitrageThresholds {
     pub min_apy_delta: u32, // Minimum APY difference to trigger rebalance (basis points)
     pub max_il_tolerance: u32, // Maximum acceptable IL (basis points)
     pub cooldown_period: u64, // Seconds between rebalances, applied per vault
+}
+
+/// Validation-failure tracking for one pool's oracle feed (Issue #289).
+///
+/// A feed whose last observation failed validation must not influence routing.
+/// The off-chain validator calls [`RebalanceEngine::record_feed_validation_failure`]
+/// each time it rejects an observation; once `failure_count` reaches the
+/// configured exclusion threshold the feed is marked `excluded` and every
+/// routing path skips the pool until a valid observation is accepted again.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedValidationRecord {
+    /// Rejected observations counted since the feed was last accepted.
+    pub failure_count: u32,
+    /// Ledger timestamp of the most recent rejected observation.
+    pub last_failure_at: u64,
+    /// True once `failure_count` reached the exclusion threshold.
+    pub excluded: bool,
 }
 
 /// One oracle observation for a pool.
@@ -173,6 +195,15 @@ impl RebalanceEngine {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "max_apy_age"), &DEFAULT_MAX_APY_AGE);
+        // Issue #289: feed validation-failure tracking, keyed by pool.
+        let feed_validation: Map<Address, FeedValidationRecord> = Map::new(&env);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &feed_validation);
+        env.storage().instance().set(
+            &Symbol::new(&env, "feed_failure_threshold"),
+            &DEFAULT_FEED_FAILURE_THRESHOLD,
+        );
         // Record the storage schema version of this build; `migrate` moves it
         // forward after an upgrade swaps the code.
         crate::upgrade::set_storage_version(&env, crate::upgrade::STORAGE_VERSION);
@@ -594,6 +625,124 @@ impl RebalanceEngine {
             .unwrap_or(Vec::new(&env))
     }
 
+    // ============ FEED VALIDATION TRACKING (Issue #289) ============
+
+    /// Number of rejected observations that excludes a pool from routing.
+    pub fn get_feed_failure_threshold(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "feed_failure_threshold"))
+            .unwrap_or(DEFAULT_FEED_FAILURE_THRESHOLD)
+    }
+
+    /// Set the number of rejected observations that excludes a pool (admin only).
+    ///
+    /// A threshold of `0` disables exclusion: validation failures are still
+    /// recorded and emitted, but they never remove a pool from routing.
+    pub fn set_feed_failure_threshold(env: Env, admin: Address, threshold: u32) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_failure_threshold"), &threshold);
+
+        env.events().publish(
+            (Symbol::new(&env, "feed_failure_threshold_updated"),),
+            (admin, threshold),
+        );
+    }
+
+    /// Record that the latest observation for `pool_id` failed validation.
+    ///
+    /// Called by the off-chain validator after it rejects an observation
+    /// (Issue #289). The pool is excluded from routing once the number of
+    /// consecutive failures reaches the configured threshold. Returns the
+    /// updated record.
+    pub fn record_feed_validation_failure(env: Env, pool_id: Address) -> FeedValidationRecord {
+        Self::require_not_paused(&env);
+
+        let mut records = Self::get_feed_validation_map(env.clone());
+        let mut record = records
+            .get(pool_id.clone())
+            .unwrap_or(FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            });
+
+        record.failure_count = record.failure_count.saturating_add(1);
+        record.last_failure_at = env.ledger().timestamp();
+
+        let threshold = Self::get_feed_failure_threshold(env.clone());
+        if threshold > 0 && record.failure_count >= threshold {
+            record.excluded = true;
+        }
+
+        records.set(pool_id.clone(), record.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &records);
+
+        env.events().publish(
+            (Symbol::new(&env, "feed_validation_failed"), pool_id),
+            (record.failure_count, record.excluded),
+        );
+
+        record
+    }
+
+    /// Clear a pool's validation-failure state after a valid observation is
+    /// accepted, re-enabling it for routing. Returns the record it replaced.
+    pub fn record_feed_validation_success(env: Env, pool_id: Address) -> FeedValidationRecord {
+        Self::require_not_paused(&env);
+
+        let mut records = Self::get_feed_validation_map(env.clone());
+        let previous = records
+            .get(pool_id.clone())
+            .unwrap_or(FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            });
+
+        records.set(
+            pool_id.clone(),
+            FeedValidationRecord {
+                failure_count: 0,
+                last_failure_at: 0,
+                excluded: false,
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "feed_validation"), &records);
+
+        env.events()
+            .publish((Symbol::new(&env, "feed_validation_cleared"),), (pool_id,));
+
+        previous
+    }
+
+    /// Validation-failure record for a pool, if any failure has been recorded.
+    pub fn get_feed_validation_record(env: Env, pool_id: Address) -> Option<FeedValidationRecord> {
+        Self::get_feed_validation_map(env).get(pool_id)
+    }
+
+    /// True when the pool's feed is currently excluded from routing (Issue #289).
+    pub fn is_feed_excluded(env: Env, pool_id: Address) -> bool {
+        match Self::get_feed_validation_map(env).get(pool_id) {
+            Some(record) => record.excluded,
+            None => false,
+        }
+    }
+
+    /// Internal: the feed validation map, keyed by pool address.
+    fn get_feed_validation_map(env: Env) -> Map<Address, FeedValidationRecord> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "feed_validation"))
+            .unwrap_or(Map::new(&env))
+    }
+
     // ============ REBALANCE PACING (Issue #302) ============
 
     /// Current rebalance pacing limits (zero when disabled).
@@ -809,6 +958,11 @@ impl RebalanceEngine {
         // Each candidate APY is resolved through the oracle first so a stale
         // snapshot in the strategy cannot hide (or invent) an opportunity.
         for mut candidate in strategy.allocations.iter() {
+            // Pools whose feed failed validation are not routing candidates
+            // (Issue #289).
+            if Self::is_feed_excluded(env.clone(), candidate.pool_id.clone()) {
+                continue;
+            }
             let candidate_apy = Self::resolve_apy(env, &candidate.pool_id, candidate.current_apy);
             if candidate.pool_id != current_allocation.pool_id
                 && candidate_apy > current_apy
@@ -1028,6 +1182,12 @@ impl RebalanceEngine {
 
         // Scan each available pool
         for pool in available_pools {
+            // A pool whose feed last failed validation must not influence
+            // routing (Issue #289).
+            if Self::is_feed_excluded(env.clone(), pool.pool_id.clone()) {
+                continue;
+            }
+
             // Same for the candidate pool: the registry wins over the snapshot.
             let pool_apy = Self::resolve_apy(&env, &pool.pool_id, pool.current_apy);
             let apy_delta = pool_apy.saturating_sub(vault_apy);
@@ -1150,6 +1310,13 @@ impl RebalanceEngine {
         amount: i128,
     ) -> bool {
         Self::require_not_paused(&env);
+
+        // A pool whose feed last failed validation must not be the destination
+        // of a rebalance, even if a stale opportunity payload still names it
+        // (Issue #289).
+        if Self::is_feed_excluded(env.clone(), opportunity.pool_id.clone()) {
+            return false;
+        }
 
         // Enforce cooldown per vault to prevent churn
         if Self::is_vault_in_cooldown(env.clone(), vault_id.clone()) {
@@ -1837,5 +2004,212 @@ mod tests {
         // needing a token-funded successful rebalance here.
         assert!(!RebalanceEngine::breaker_trips(true, false, false));
         assert!(RebalanceEngine::breaker_trips(false, false, false));
+    }
+
+    // ============ FEED VALIDATION EXCLUSION TESTS (Issue #289) ============
+
+    /// A pool is excluded only once its failures reach the configured threshold,
+    /// and repeated failures keep it excluded.
+    #[test]
+    fn test_feed_validation_failure_excludes_pool_at_threshold() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &3);
+        assert_eq!(client.get_feed_failure_threshold(), 3);
+        assert!(!client.is_feed_excluded(&pool));
+        assert!(client.get_feed_validation_record(&pool).is_none());
+
+        env.ledger().with_mut(|li| li.timestamp = 100);
+        let first = client.record_feed_validation_failure(&pool);
+        assert_eq!(first.failure_count, 1);
+        assert_eq!(first.last_failure_at, 100);
+        assert!(!first.excluded, "one failure is not enough to exclude");
+
+        env.ledger().with_mut(|li| li.timestamp = 200);
+        let second = client.record_feed_validation_failure(&pool);
+        assert_eq!(second.failure_count, 2);
+        assert!(!second.excluded);
+
+        env.ledger().with_mut(|li| li.timestamp = 300);
+        let third = client.record_feed_validation_failure(&pool);
+        assert_eq!(third.failure_count, 3);
+        assert!(third.excluded, "threshold reached must exclude the pool");
+        assert!(client.is_feed_excluded(&pool));
+    }
+
+    /// An accepted observation clears the failure state and re-enables routing.
+    #[test]
+    fn test_feed_validation_success_clears_exclusion() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &2);
+        client.record_feed_validation_failure(&pool);
+        client.record_feed_validation_failure(&pool);
+        assert!(client.is_feed_excluded(&pool));
+
+        let replaced = client.record_feed_validation_success(&pool);
+        assert_eq!(replaced.failure_count, 2);
+        assert!(replaced.excluded, "the replaced record is returned");
+
+        assert!(!client.is_feed_excluded(&pool));
+        let record = client.get_feed_validation_record(&pool).unwrap();
+        assert_eq!(record.failure_count, 0);
+        assert!(!record.excluded);
+    }
+
+    /// A threshold of zero records failures but never excludes a pool.
+    #[test]
+    fn test_zero_failure_threshold_disables_exclusion() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &0);
+        for _ in 0..5 {
+            client.record_feed_validation_failure(&pool);
+        }
+
+        let record = client.get_feed_validation_record(&pool).unwrap();
+        assert_eq!(record.failure_count, 5);
+        assert!(!record.excluded);
+        assert!(!client.is_feed_excluded(&pool));
+    }
+
+    /// Failure records are tracked independently per pool.
+    #[test]
+    fn test_feed_validation_records_are_isolated_per_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &2);
+        client.record_feed_validation_failure(&pool_a);
+        client.record_feed_validation_failure(&pool_a);
+
+        assert!(client.is_feed_excluded(&pool_a));
+        assert!(!client.is_feed_excluded(&pool_b));
+        assert!(client.get_feed_validation_record(&pool_b).is_none());
+    }
+
+    /// Setting the exclusion threshold is admin-only.
+    #[test]
+    fn test_set_feed_failure_threshold_is_admin_only() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_feed_failure_threshold(&stranger, &5);
+        }));
+
+        assert!(result.is_err(), "threshold must be admin only");
+    }
+
+    /// An excluded candidate pool is skipped by `scan_opportunities`.
+    #[test]
+    fn test_scan_opportunities_skips_excluded_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let good_pool = Address::generate(&env);
+        let bad_pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &100, &86400);
+        client.set_feed_failure_threshold(&admin, &1);
+
+        let pools = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &good_pool, 5000, 3000, 3000),
+                allocation(&env, &bad_pool, 5000, 3000, 3000),
+            ],
+        );
+
+        // Both candidates clear the thresholds before any failure is recorded.
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &1000, &pools).len(),
+            2
+        );
+
+        client.record_feed_validation_failure(&bad_pool);
+
+        let opportunities = client.scan_opportunities(&vault_pool, &1000, &pools);
+        assert_eq!(opportunities.len(), 1);
+        assert_eq!(opportunities.get(0).unwrap().pool_id, good_pool);
+    }
+
+    /// An excluded pool is skipped by the rebalance proposal analysis.
+    #[test]
+    fn test_analyze_rebalance_skips_excluded_pool() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        let alloc = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &pool_a, 5000, 900, 1000),
+                allocation(&env, &pool_b, 5000, 900, 1000),
+            ],
+        );
+        let sid = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Exclude"),
+            &2,
+            &100,
+            &500,
+            &3600,
+            &alloc,
+        );
+
+        // B is the better pool: A must move into it.
+        client.update_pool_apy(&admin, &pool_a, &500);
+        client.update_pool_apy(&admin, &pool_b, &1500);
+        let proposals = client.analyze_rebalance_opportunities(&sid);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals.get(0).unwrap().to_pool, pool_b);
+
+        // Once B's feed fails validation it is no longer a routing candidate.
+        client.set_feed_failure_threshold(&admin, &1);
+        client.record_feed_validation_failure(&pool_b);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 0);
+
+        // A valid observation restores it.
+        client.record_feed_validation_success(&pool_b);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 1);
+    }
+
+    /// Execution refuses a destination pool whose feed is excluded, before it
+    /// touches the vault.
+    #[test]
+    fn test_execute_flash_rebalance_rejects_excluded_destination() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let destination = Address::generate(&env);
+        let vault_id = Address::generate(&env);
+
+        client.set_feed_failure_threshold(&admin, &1);
+        client.record_feed_validation_failure(&destination);
+        assert!(client.is_feed_excluded(&destination));
+
+        let opportunity = ArbitrageOpportunity {
+            pool_id: destination.clone(),
+            current_apy: 1000,
+            projected_apy: 2500,
+            il_risk: 50,
+            net_profit: 1_000_000,
+            apy_delta: 1500,
+            recommended: true,
+        };
+
+        // `vault_id` is not a deployed vault: the exclusion guard must reject
+        // the call before any vault lookup happens.
+        assert!(!client.execute_flash_rebalance(&admin, &vault_id, &opportunity, &1_000));
     }
 }
