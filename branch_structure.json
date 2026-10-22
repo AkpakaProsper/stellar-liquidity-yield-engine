@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "fix/issue-323-keeper-should-log-contract-calls-it-attempted",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "fix/issue-323-keeper-should-log-contract-calls-it-attempted": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "fix/issue-323-keeper-should-log-contract-calls-it-attempted",
+    "origin"
+  ]
+}
