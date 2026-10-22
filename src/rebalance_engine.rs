@@ -157,6 +157,24 @@ pub struct PoolApyRecord {
     pub updated_by: Address, // Admin or keeper that pushed the observation
 }
 
+/// Staleness snapshot for one pool's oracle feed (Issue #293).
+///
+/// Gives off-chain monitors a direct data-age signal instead of making them
+/// reconstruct it from `updated_at` and the current ledger time.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedDataAge {
+    /// Ledger timestamp of the most recent observation, or 0 when unpublished.
+    pub updated_at: u64,
+    /// Seconds elapsed since that observation (saturating; 0 when unpublished).
+    pub age_seconds: u64,
+    /// Age at or after which the observation is considered stale.
+    pub max_age_seconds: u64,
+    /// True when the feed has an observation and `age_seconds` is within the
+    /// configured maximum age. False when unpublished or stale.
+    pub fresh: bool,
+}
+
 #[contract]
 pub struct RebalanceEngine;
 
@@ -620,6 +638,58 @@ impl RebalanceEngine {
             }
             None => false,
         }
+    }
+
+    /// Data-age snapshot for a pool's oracle feed (Issue #293).
+    ///
+    /// An unpublished feed reports `age_seconds == 0` and `fresh == false`, so
+    /// a monitor cannot mistake "no data" for "brand new data"; the `fresh`
+    /// flag is the authoritative signal in both cases.
+    pub fn get_feed_data_age(env: Env, pool_id: Address) -> FeedDataAge {
+        let max_age_seconds = Self::get_max_apy_age(env.clone());
+        match Self::get_apy_registry(env.clone()).get(pool_id) {
+            Some(record) => {
+                let age_seconds = env.ledger().timestamp().saturating_sub(record.updated_at);
+                FeedDataAge {
+                    updated_at: record.updated_at,
+                    age_seconds,
+                    max_age_seconds,
+                    fresh: age_seconds <= max_age_seconds,
+                }
+            }
+            None => FeedDataAge {
+                updated_at: 0,
+                age_seconds: 0,
+                max_age_seconds,
+                fresh: false,
+            },
+        }
+    }
+
+    /// Seconds since the pool's most recent observation, or `None` when the
+    /// feed has never been published (Issue #293).
+    pub fn get_feed_age_seconds(env: Env, pool_id: Address) -> Option<u64> {
+        Self::get_apy_registry(env.clone())
+            .get(pool_id)
+            .map(|record| env.ledger().timestamp().saturating_sub(record.updated_at))
+    }
+
+    /// Emit the current data age of a pool's feed as an event, so off-chain
+    /// monitors can record staleness without polling (Issue #293).
+    ///
+    /// Returns the same snapshot the event carries.
+    pub fn emit_feed_data_age(env: Env, pool_id: Address) -> FeedDataAge {
+        let age = Self::get_feed_data_age(env.clone(), pool_id.clone());
+        env.events().publish(
+            (Symbol::new(&env, "feed_data_age"), pool_id),
+            (
+                age.updated_at,
+                age.age_seconds,
+                age.max_age_seconds,
+                age.fresh,
+            ),
+        );
+        age
     }
 
     /// Replace the set of addresses allowed to push APY observations (admin only).
@@ -2568,5 +2638,154 @@ mod tests {
         assert!(negative.is_err(), "a negative minimum is meaningless");
 
         assert_eq!(client.get_min_net_profit(), 0);
+    }
+
+    // ============ FEED DATA AGE TESTS (Issue #293) ============
+
+    /// A published feed reports its age and freshness, and the age grows with
+    /// the ledger clock.
+    #[test]
+    fn test_feed_data_age_tracks_age_and_freshness() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(1000);
+        client.update_pool_apy(&admin, &pool, &1200);
+        client.set_max_apy_age(&admin, &500);
+
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 1000);
+        assert_eq!(age.age_seconds, 0);
+        assert_eq!(age.max_age_seconds, 500);
+        assert!(age.fresh);
+
+        env.ledger().set_timestamp(1400);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 1000);
+        assert_eq!(age.age_seconds, 400);
+        assert!(age.fresh, "400s is still within the 500s window");
+
+        // Exactly at the boundary the feed is still fresh (inclusive).
+        env.ledger().set_timestamp(1500);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.age_seconds, 500);
+        assert!(age.fresh);
+
+        // One second later it is stale.
+        env.ledger().set_timestamp(1501);
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.age_seconds, 501);
+        assert!(!age.fresh);
+    }
+
+    /// The age snapshot agrees with `is_apy_fresh`.
+    #[test]
+    fn test_feed_data_age_matches_is_apy_fresh() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &100);
+        env.ledger().set_timestamp(10);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        for ts in [10u64, 110, 111, 200] {
+            env.ledger().set_timestamp(ts);
+            assert_eq!(
+                client.get_feed_data_age(&pool).fresh,
+                client.is_apy_fresh(&pool),
+                "snapshot and predicate must agree at t={}",
+                ts
+            );
+        }
+    }
+
+    /// An unpublished feed reports no data rather than appearing brand new.
+    #[test]
+    fn test_feed_data_age_unpublished_is_not_fresh() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &300);
+        env.ledger().set_timestamp(50_000);
+
+        let age = client.get_feed_data_age(&pool);
+        assert_eq!(age.updated_at, 0);
+        assert_eq!(age.age_seconds, 0);
+        assert_eq!(age.max_age_seconds, 300);
+        assert!(!age.fresh, "no observation must never read as fresh");
+        assert!(client.get_feed_age_seconds(&pool).is_none());
+    }
+
+    /// `get_feed_age_seconds` returns `None` before publication and the exact
+    /// age afterwards.
+    #[test]
+    fn test_get_feed_age_seconds() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        assert!(client.get_feed_age_seconds(&pool).is_none());
+
+        env.ledger().set_timestamp(700);
+        client.update_pool_apy(&admin, &pool, &1000);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(0));
+
+        env.ledger().set_timestamp(760);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(60));
+    }
+
+    /// A republished value still resets the age.
+    #[test]
+    fn test_republished_feed_resets_age() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+        env.ledger().set_timestamp(500);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(400));
+
+        client.update_pool_apy(&admin, &pool, &900);
+        assert_eq!(client.get_feed_age_seconds(&pool), Some(0));
+        assert!(client.get_feed_data_age(&pool).fresh);
+    }
+
+    /// `emit_feed_data_age` publishes the snapshot and returns it unchanged.
+    #[test]
+    fn test_emit_feed_data_age_publishes_snapshot() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &600);
+        env.ledger().set_timestamp(2_000);
+        client.update_pool_apy(&admin, &pool, &1500);
+
+        env.ledger().set_timestamp(2_250);
+        let returned = client.emit_feed_data_age(&pool);
+
+        assert_eq!(returned.updated_at, 2_000);
+        assert_eq!(returned.age_seconds, 250);
+        assert_eq!(returned.max_age_seconds, 600);
+        assert!(returned.fresh);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&env, "feed_data_age"));
+
+        let (updated_at, age_seconds, max_age_seconds, fresh): (u64, u64, u64, bool) =
+            <(u64, u64, u64, bool)>::try_from_val(&env, &data).unwrap();
+        assert_eq!(updated_at, 2_000);
+        assert_eq!(age_seconds, 250);
+        assert_eq!(max_age_seconds, 600);
+        assert!(fresh);
     }
 }
