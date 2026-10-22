@@ -536,22 +536,37 @@ impl RebalanceEngine {
         // method argument.
         caller.require_auth();
 
+        let mut registry = Self::get_apy_registry(env.clone());
+        let previous = registry.get(pool_id.clone());
+
         let record = PoolApyRecord {
             apy_bps,
             updated_at: env.ledger().timestamp(),
             updated_by: caller.clone(),
         };
 
-        let mut registry = Self::get_apy_registry(env.clone());
+        // A re-published observation still refreshes freshness: a feeder that
+        // keeps reporting a stable rate is not stuck. Issue #295 only adds a
+        // marker so an operator can tell a genuine change from a no-op.
         registry.set(pool_id.clone(), record);
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "pool_apy"), &registry);
 
-        env.events().publish(
-            (Symbol::new(&env, "pool_apy_updated"), pool_id),
-            (caller, apy_bps),
-        );
+        match previous {
+            Some(prev) if prev.apy_bps == apy_bps => {
+                env.events().publish(
+                    (Symbol::new(&env, "pool_apy_unchanged"), pool_id),
+                    (caller, apy_bps, prev.updated_at),
+                );
+            }
+            _ => {
+                env.events().publish(
+                    (Symbol::new(&env, "pool_apy_updated"), pool_id),
+                    (caller, apy_bps),
+                );
+            }
+        }
     }
 
     /// Current APY of a pool from the oracle registry, in basis points.
@@ -2211,5 +2226,150 @@ mod tests {
         // `vault_id` is not a deployed vault: the exclusion guard must reject
         // the call before any vault lookup happens.
         assert!(!client.execute_flash_rebalance(&admin, &vault_id, &opportunity, &1_000));
+    }
+
+    // ============ NO-CHANGE FEED UPDATE MARKER TESTS (Issue #295) ============
+
+    /// Topic of the only event published by the most recent invocation.
+    ///
+    /// `env.events().all()` only exposes the events of the latest contract
+    /// call, so each event has to be inspected before the next call is made.
+    fn last_event_topic(env: &Env) -> Symbol {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+        let events = env.events().all();
+        let (_contract, topics, _data) = events.last().unwrap();
+        Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap()
+    }
+
+    /// A feed republishing its current value emits the no-change marker.
+    #[test]
+    fn test_unchanged_apy_update_emits_no_change_marker() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "a first publication is a real update"
+        );
+
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged"),
+            "republishing the same value must be identifiable"
+        );
+
+        // Repeating the same value keeps reporting the no-op marker.
+        client.update_pool_apy(&admin, &pool, &1200);
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged")
+        );
+    }
+
+    /// The no-change marker carries the caller, value and the timestamp of the
+    /// observation it replaced.
+    #[test]
+    fn test_no_change_marker_payload_records_previous_timestamp() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::TryFromVal;
+
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        env.ledger().set_timestamp(250);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        let events = env.events().all();
+        let (_contract, topics, data) = events.last().unwrap();
+        let topic: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+        assert_eq!(topic, Symbol::new(&env, "pool_apy_unchanged"));
+
+        let (by, value, previous_at): (Address, u32, u64) =
+            <(Address, u32, u64)>::try_from_val(&env, &data).unwrap();
+        assert_eq!(by, admin);
+        assert_eq!(value, 900);
+        assert_eq!(previous_at, 100, "the marker reports the replaced stamp");
+    }
+
+    /// A changed value keeps emitting the normal update event.
+    #[test]
+    fn test_changed_apy_update_emits_normal_event() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.update_pool_apy(&admin, &pool, &900);
+        client.update_pool_apy(&admin, &pool, &1500);
+
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "a different value is a genuine update"
+        );
+    }
+
+    /// A no-op update still refreshes freshness and provenance, so a feeder
+    /// that keeps reporting a stable rate is not treated as stale.
+    #[test]
+    fn test_unchanged_update_refreshes_freshness_and_provenance() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        env.ledger().set_timestamp(100);
+        client.update_pool_apy(&admin, &pool, &900);
+
+        client.set_max_apy_age(&admin, &50);
+        env.ledger().set_timestamp(140);
+        assert!(client.is_apy_fresh(&pool));
+
+        // Past the max age the feed is stale...
+        env.ledger().set_timestamp(200);
+        assert!(!client.is_apy_fresh(&pool));
+
+        // ...and a same-value refresh from a keeper brings it back and stamps
+        // the new provenance.
+        client.set_apy_keepers(&admin, &Vec::from_array(&env, [keeper.clone()]));
+        client.update_pool_apy(&keeper, &pool, &900);
+
+        // Inspect the event before any other call, since `events().all()` only
+        // exposes the latest invocation.
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_unchanged")
+        );
+
+        let record = client.get_pool_apy_record(&pool).unwrap();
+        assert_eq!(record.updated_at, 200);
+        assert_eq!(record.updated_by, keeper);
+        assert!(client.is_apy_fresh(&pool));
+    }
+
+    /// A first publication for a pool is never marked as a no-op, even when the
+    /// value happens to be zero.
+    #[test]
+    fn test_first_publication_is_not_marked_unchanged() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        assert!(client.get_pool_apy_record(&pool).is_none());
+        client.update_pool_apy(&admin, &pool, &0);
+
+        assert_eq!(
+            last_event_topic(&env),
+            Symbol::new(&env, "pool_apy_updated"),
+            "there is no previous observation to be unchanged from"
+        );
     }
 }
